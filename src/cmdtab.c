@@ -43,6 +43,12 @@
 #include <commoncontrols.h>
 #include <mmsystem.h> // PlaySound
 #include <shellscalingapi.h> // GetDpiForMonitor
+#include <appmodel.h> // GetApplicationUserModelId
+#include <shlobj.h> // SHParseDisplayName
+
+#ifndef APPLICATION_USER_MODEL_ID_MAX_LENGTH
+#define APPLICATION_USER_MODEL_ID_MAX_LENGTH 130 // Missing from MinGW's appmodel.h
+#endif
 
 #ifdef _MSC_VER
 #pragma comment(lib, "user32.lib")
@@ -460,6 +466,110 @@ static handle GetAppIcon(string *filepath)
 	return icon; // Caller is responsible for calling DestroyIcon
 }
 
+static bool GetPackagedAppInfo(handle hwnd, string *name, handle *icon)
+{
+	// Packaged apps (MSIX, like WhatsApp) can run from an exe without a pretty
+	// name or icon of its own (ex. WhatsApp.Root.exe). For those, use the name
+	// and icon of the app's Start menu entry, found through the process'
+	// Application User Model ID. Returns false for regular (unpackaged) apps.
+
+	ULONG pid;
+	GetWindowThreadProcessId(hwnd, &pid);
+	handle process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+	if (!process || process == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+	u16 aumid[APPLICATION_USER_MODEL_ID_MAX_LENGTH];
+	UINT32 length = countof(aumid);
+	LONG error = GetApplicationUserModelId(process, &length, aumid);
+	CloseHandle(process);
+	if (error != ERROR_SUCCESS) {
+		return false; // APPMODEL_ERROR_NO_APPLICATION for unpackaged apps
+	}
+	u16 shellpath[MAX_PATH];
+	StringCchPrintfW(shellpath, countof(shellpath), L"shell:AppsFolder\\%s", aumid);
+	PIDLIST_ABSOLUTE pidl = null;
+	if (FAILED(SHParseDisplayName(shellpath, null, &pidl, 0, null))) {
+		return false;
+	}
+	SHFILEINFOW info = {0};
+	bool found = SHGetFileInfoW((u16 *)pidl, 0, &info, sizeof info, SHGFI_PIDL | SHGFI_DISPLAYNAME | SHGFI_SYSICONINDEX) && info.szDisplayName[0];
+	CoTaskMemFree(pidl);
+	if (!found) {
+		return false;
+	}
+	IImageList *list = {0};
+	if (FAILED(SHGetImageList(SHIL_JUMBO, &IID_IImageList, (void **)&list))) {
+		return false;
+	}
+	HICON hicon = {0};
+	IImageList_GetIcon(list, info.iIcon, ILD_TRANSPARENT, &hicon);
+	IImageList_Release(list);
+	if (!hicon) {
+		return false;
+	}
+	StringCchCopyW(name->text, countof(name->text), info.szDisplayName);
+	name->length = (i16)lstrlenW(name->text);
+	*icon = hicon; // Caller is responsible for calling DestroyIcon
+	return true;
+}
+
+struct packagedapp {
+	string path; // Exe path of the app's process, the same key AddToApps groups apps by
+	string name; // Display name of the app's Start menu entry
+	handle icon; // Icon of the app's Start menu entry. Kept for cmdtab's lifetime, apps get copies
+};
+
+static struct packagedapp PackagedApps[64]; // Filled by CachePackagedApp
+static iz                 PackagedAppsCount;
+
+static struct packagedapp *FindPackagedApp(string *path)
+{
+	for (iz i = 0; i < PackagedAppsCount; i++) {
+		if (StringsAreEqual(path, &PackagedApps[i].path)) {
+			return &PackagedApps[i];
+		}
+	}
+	return null;
+}
+
+static void CachePackagedApp(handle hwnd)
+{
+	// GetPackagedAppInfo calls into the shell over COM, which fails inside the
+	// low-level keyboard hook (RPC_E_CANTCALLOUT_ININPUTSYNCCALL) and would be
+	// too slow there anyway (~50-150 ms per app the first time). So packaged
+	// apps are resolved ahead of time, at startup and on window activation,
+	// and AddToApps only reads the result from this cache.
+	hwnd = GetCoreWindow(hwnd);
+	if (!hwnd || !IsAltTabWindow(hwnd) || PackagedAppsCount >= countof(PackagedApps)) {
+		return;
+	}
+	string path = GetExePath(hwnd);
+	if (path.length <= 0 || FindPackagedApp(&path)) {
+		return;
+	}
+	string name = {0};
+	handle icon = null;
+	if (GetPackagedAppInfo(hwnd, &name, &icon)) {
+		struct packagedapp *app = &PackagedApps[PackagedAppsCount++];
+		app->path = path;
+		app->name = name;
+		app->icon = icon;
+	}
+}
+
+static BOOL CALLBACK _CachePackagedApp(HWND hwnd, LPARAM lparam)
+{
+	// EnumWindowsProc used by CachePackagedApps
+	CachePackagedApp(hwnd);
+	return true; // Return true to continue EnumWindows
+}
+
+static void CachePackagedApps(void)
+{
+	EnumWindows(_CachePackagedApp, 0);
+}
+
 static bool IsDarkModeEnabled(void)
 {
 	ULONG value;
@@ -733,11 +843,11 @@ static void InitConfig(void)
 		.wrapbump                = true,
 		// Appearance
 		.darkmode                = false,
-		.switcherHorzMargin      = 24,
-		.switcherVertMargin      = 32,
-		.iconSize                = 64,
-		.iconHorzMargin          =  8,
-		.fontSize                = 16,
+		.switcherHorzMargin      = 18,
+		.switcherVertMargin      = 24,
+		.iconSize                = 48,
+		.iconHorzMargin          =  6,
+		.fontSize                = 12,
 		// Blacklist
 		.blacklist = {
 			{ null,                       L"ApplicationFrameWindow" },
@@ -843,6 +953,7 @@ static int RunCmdTab(handle instance, u16 *args)
 	InitSwitcherWindow(instance);
 	InitWindowActivationTracking();
 	InitKeyboardHook();
+	CachePackagedApps(); // Resolve packaged apps' names and icons now, see CachePackagedApp
 
 	// Run message loop
 	for (MSG msg; GetMessageW(&msg, Switcher, 0, 0) > 0;) DispatchMessageW(&msg); // Not handling -1 errors. Whatever
@@ -1040,14 +1151,15 @@ static void AddToApps(handle hwnd)
 			Error(Switcher, L"ERROR reached max. apps\n");
 			return;
 		}
-		string title = Config.groupByApp ? GetAppName(&filepath) : GetWindowTitle(hwnd); // TODO Fall back to app name for empty window titles
+		struct packagedapp *packaged = FindPackagedApp(&filepath); // Filled outside this kbd hook, see CachePackagedApp
+		string title = Config.groupByApp ? (packaged ? packaged->name : GetAppName(&filepath)) : GetWindowTitle(hwnd); // TODO Fall back to app name for empty window titles
 		// This app is not previously added, so create new app entry for it
 		// Since I reset by truncating (setting AppsCount to 0), make sure to overwrite all struct fields when reusing array slots
 		app = &Apps[AppsCount++];
 		if (app->icon) DestroyIcon(app->icon); // In fact, I have to do a little lazy cleanup
 		app->path = filepath;
 		app->title = title;
-		app->icon = GetAppIcon(&filepath);
+		app->icon = packaged ? CopyIcon(packaged->icon) : GetAppIcon(&filepath); // Copy, since app icons are destroyed on reuse
 		app->windowsCount = 0; // Same truncation trick here (but hwnds are not structs, so no fields to overwrite)
 	}
 	if (app->windowsCount >= countof(app->windows)) {
@@ -2058,10 +2170,12 @@ static VOID CALLBACK EventHookProcedure(HWINEVENTHOOK hook, ULONG event, HWND hw
 		case EVENT_SYSTEM_FOREGROUND:
 			Log(L"FOREGROUND WINDOW EVENT\n");
 			OnShellWindowActivated(hwnd);
+			CachePackagedApp(hwnd); // Catch packaged apps started after cmdtab
 			break;
 		case EVENT_OBJECT_UNCLOAKED:
 			Log(L"UNCLOAKED WINDOW EVENT\n");
 			OnShellWindowActivated(hwnd);
+			CachePackagedApp(hwnd);
 			break;
 	}
 }
