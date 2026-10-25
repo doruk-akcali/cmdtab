@@ -45,6 +45,7 @@
 #include <shellscalingapi.h> // GetDpiForMonitor
 #include <appmodel.h> // GetApplicationUserModelId
 #include <shlobj.h> // SHParseDisplayName
+#include <math.h> // cosf, fabsf for the dock magnification
 
 #ifndef APPLICATION_USER_MODEL_ID_MAX_LENGTH
 #define APPLICATION_USER_MODEL_ID_MAX_LENGTH 130 // Missing from MinGW's appmodel.h
@@ -817,6 +818,22 @@ static HPEN        NoneOutline;     // Pen with window background color
 static i32         MouseX, MouseY;  // Mouse position, for highlighting and clicking app icons in switcher
 static bool        MouseDown;       // Is left mouse button down?
 static struct app *MouseApp;        // Pointer to one of the elements in 'Apps' array. The app under MouseX,MouseY
+// Dock-style magnification: the selected app's icon is magnified like the
+// macOS Dock under the pointer, its neighbours less with distance, and each
+// Tab glides the magnification from the previous app to the new one.
+#define DOCK_TIMER_ID   1
+#define DOCK_FRAME_MS   8            // Animation timer period
+#define DOCK_MOVE_MS    170          // Glide from one app to the next
+#define DOCK_POP_MS     150          // Magnification growing in when the switcher opens
+static const f32   DockMaxScale = 1.3f; // Size of the focused icon relative to the others
+static const f32   DockRange    = 2.6f;  // Falloff radius, in icons, of the magnification
+static f32         DockFocus;       // Animated focus position, as a (fractional) index into 'Apps'
+static f32         DockFrom, DockTo;// Glide endpoints
+static f32         DockMag;         // 0..1, how much of the magnification is applied (for the pop-in)
+static u32         DockMoveStart;   // timeGetTime() when the current glide began
+static u32         DockPopStart;    // timeGetTime() when the pop-in began
+static bool        DockAnimating;   // Is the animation timer running?
+static RECT        DockRects[128];  // Icon rectangles of the last layout, parallel to 'Apps'
 
 
 //================
@@ -847,7 +864,7 @@ static void InitConfig(void)
 		.switcherVertMargin      = 24,
 		.iconSize                = 48,
 		.iconHorzMargin          =  6,
-		.fontSize                = 12,
+		.fontSize                = 14,
 		// Blacklist
 		.blacklist = {
 			{ null,                       L"ApplicationFrameWindow" },
@@ -1375,8 +1392,13 @@ static void ResizeSwitcher(void)
 	u32  iconsHeight =  iconRows * iconSize;
 	u32 marginHeight =         2 * switcherVertMargin;
 
-	u32 w = iconsWidth + paddingWidth + marginWidth;
-	u32 h = iconsHeight + marginHeight;
+	// Room for the magnification: at most about DockRange icons' worth of
+	// extra width across the bulge, and the focused icon's extra height
+	u32 dockWidth  = (DockMaxScale - 1) * iconSize * (DockRange + 0.5f);
+	u32 dockHeight = (DockMaxScale - 1) * iconSize;
+
+	u32 w = iconsWidth + paddingWidth + marginWidth + dockWidth;
+	u32 h = iconsHeight + marginHeight + dockHeight;
 	i32 x = mi.rcMonitor.left + (mi.rcMonitor.right - mi.rcMonitor.left - w) / 2;
 	i32 y = mi.rcMonitor.top + (mi.rcMonitor.bottom - mi.rcMonitor.top - h) / 2;
 
@@ -1421,8 +1443,10 @@ static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 	u32 SEL_HORZ_OFF = DrawingDims.selHorzOff;
 	u32 SEL_VERT_OFF = DrawingDims.selVertOff;
 
-	i32  width = ICON_WIDTH;
-	i32 height = ICON_WIDTH;
+	// The rect carries the icon's magnified size
+	i32  width = appRect.right - appRect.left;
+	i32 height = appRect.bottom - appRect.top;
+	(void)ICON_WIDTH;
 
 	bool hasMouseover = MouseApp != null;
 	bool hasMousedown = hasMouseover && MouseDown;
@@ -1511,6 +1535,114 @@ static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 	}
 }
 
+//================
+// Dock magnification
+//================
+
+static f32 DockEase(f32 t) // Ease-out cubic: quick start, soft landing
+{
+	if (t <= 0) return 0;
+	if (t >= 1) return 1;
+	f32 u = 1 - t;
+	return 1 - u * u * u;
+}
+
+static f32 DockScale(int i) // Magnification of app 'i' for the current focus
+{
+	f32 d = fabsf((f32)i - DockFocus);
+	if (d >= DockRange) return 1;
+	f32 falloff = (cosf(3.14159265f * d / DockRange) + 1) / 2; // 1 at the focus, 0 at DockRange
+	return 1 + (DockMaxScale - 1) * falloff * DockMag;
+}
+
+// Lays out every icon for the current focus into 'DockRects': icons sit on a
+// shared baseline and grow upward, and the row stays centered as it widens
+static void DockLayout(void)
+{
+	u32 ICON_WIDTH = DrawingDims.iconSize;
+	u32 ICON_PAD   = DrawingDims.iconHorzMargin;
+	u32 VERT_PAD   = DrawingDims.switcherVertMargin;
+	i32 windowWidth = DrawingDims.drawRect.right - DrawingDims.drawRect.left;
+
+	f32 rowWidth = 0;
+	for (int i = 0; i < AppsCount; i++) {
+		rowWidth += ICON_PAD + ICON_WIDTH * DockScale(i) + ICON_PAD;
+	}
+
+	i32 baseline = VERT_PAD + (i32)(ICON_WIDTH * DockMaxScale);
+	f32 x = (windowWidth - rowWidth) / 2;
+	for (int i = 0; i < AppsCount && i < countof(DockRects); i++) {
+		i32 size = (i32)(ICON_WIDTH * DockScale(i) + 0.5f);
+		DockRects[i].left   = (i32)(x + ICON_PAD + 0.5f);
+		DockRects[i].right  = DockRects[i].left + size;
+		DockRects[i].bottom = baseline;
+		DockRects[i].top    = baseline - size;
+		x += ICON_PAD + size + ICON_PAD;
+	}
+}
+
+static void DockStopTimer(void)
+{
+	if (DockAnimating) {
+		KillTimer(Switcher, DOCK_TIMER_ID);
+		timeEndPeriod(1);
+		DockAnimating = false;
+	}
+}
+
+static void DockStartTimer(void)
+{
+	if (!DockAnimating) {
+		timeBeginPeriod(1); // Smooth frames while animating only
+		SetTimer(Switcher, DOCK_TIMER_ID, DOCK_FRAME_MS, null);
+		DockAnimating = true;
+	}
+}
+
+// The switcher is opening: start from the app in front (index 0), glide to
+// the selection and let the magnification grow in
+static void DockOpen(void)
+{
+	i32 target = SelectedApp ? (i32)(SelectedApp - Apps) : 0;
+	DockFocus = DockFrom = 0;
+	DockTo = (f32)target;
+	DockMag = 0;
+	DockMoveStart = DockPopStart = timeGetTime();
+	DockStartTimer();
+}
+
+// Called on every redraw: a new selection glides the focus from wherever it
+// is now (mid-glide included) to the new app
+static void DockFollowSelection(void)
+{
+	if (!SelectedApp) return;
+	f32 target = (f32)(SelectedApp - Apps);
+	if (target != DockTo) {
+		DockFrom = DockFocus;
+		DockTo = target;
+		DockMoveStart = timeGetTime();
+		DockStartTimer();
+	}
+}
+
+static void RedrawSwitcher(void);
+
+static i64 OnSwitcherTimer(void)
+{
+	u32 now = timeGetTime();
+	f32 move = (now - DockMoveStart) / (f32)DOCK_MOVE_MS;
+	f32 pop  = (now - DockPopStart)  / (f32)DOCK_POP_MS;
+	DockFocus = DockFrom + (DockTo - DockFrom) * DockEase(move);
+	DockMag   = DockEase(pop);
+	if (move >= 1 && pop >= 1) {
+		DockFocus = DockTo;
+		DockMag = 1;
+		DockStopTimer();
+	}
+	RedrawSwitcher();
+	return 0;
+}
+
 static void RedrawSwitcher(void)
 {
 	// TODO Use 'Config.style'
@@ -1531,7 +1663,13 @@ static void RedrawSwitcher(void)
 	// Init drawing brushes
 	if (!DrawingBg) DrawingBg = CreateSolidBrush(WIN_COLOR_BG);
 	if (!SelectionBg) SelectionBg = CreateSolidBrush(SEL_COLOR_BG);
-	if (!SelectionOutline) SelectionOutline = CreatePen(PS_SOLID, SEL_OUTLINE, SEL_COLOR);
+	// Follow accent color changes made while cmdtab is running
+	static COLORREF SelectionOutlineColor;
+	if (SelectionOutline && SelectionOutlineColor != SEL_COLOR) {
+		DeleteObject(SelectionOutline);
+		SelectionOutline = null;
+	}
+	if (!SelectionOutline) SelectionOutline = CreatePen(PS_SOLID, SEL_OUTLINE, SEL_COLOR), SelectionOutlineColor = SEL_COLOR;
 	if (!MouseOutline) MouseOutline = CreatePen(PS_SOLID, SEL_OUTLINE, MOUSE_COLOR);
 	if (!NoneOutline) NoneOutline = CreatePen(PS_SOLID, SEL_OUTLINE, WIN_COLOR_BG);
 
@@ -1547,7 +1685,20 @@ static void RedrawSwitcher(void)
 	FillRect(DrawingContext, &windowRect, DrawingBg);
 
 	// Select text font for DrawTextW (used to draw title text)
-	HFONT oldFont = (HFONT)SelectObject(DrawingContext, GetStockObject(DEFAULT_GUI_FONT));
+	// Windows 11 UI font, sized for the monitor's DPI (recreated when the scale changes)
+	static HFONT TitleFont;
+	static f32 TitleFontScale;
+	if (TitleFont && TitleFontScale != DrawingDims.drawScale) {
+		DeleteObject(TitleFont);
+		TitleFont = null;
+	}
+	if (!TitleFont) {
+		TitleFont = CreateFontW(-(i32)(DrawingDims.drawScale * Config.fontSize + 0.5f), 0, 0, 0, FW_SEMIBOLD, false, false, false,
+		                        DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS,
+		                        L"Segoe UI Variable Text");
+		TitleFontScale = DrawingDims.drawScale;
+	}
+	HFONT oldFont = (HFONT)SelectObject(DrawingContext, TitleFont ? TitleFont : GetStockObject(DEFAULT_GUI_FONT));
 
 	// This is how GDI handles memory?
 	//DeleteObject(oldPen);
@@ -1557,23 +1708,14 @@ static void RedrawSwitcher(void)
 	RECT selectedRect = {0};
 	RECT mousedownRect = {0};
 
-	for (int i = 0; i < AppsCount; i++) {
+	DockFollowSelection();
+	DockLayout();
+	(void)ICON_WIDTH; (void)ICON_PAD; (void)HORZ_PAD; (void)VERT_PAD;
+
+	for (int i = 0; i < AppsCount && i < countof(DockRects); i++) {
 		struct app *app = &Apps[i];
 
-		// Special-case math for index 0
-		i32  left0 = i == 0 ? ICON_PAD : 0;
-		i32 right0 = i != 0 ? ICON_PAD : 0;
-
-		i32  icons = (ICON_PAD + ICON_WIDTH + ICON_PAD) * i;
-		i32  width = ICON_WIDTH;
-		i32 height = ICON_WIDTH;
-
-		RECT appRect = {0};
-
-		appRect.left   = HORZ_PAD + left0 + icons + right0;
-		appRect.top    = VERT_PAD;
-		appRect.right  = appRect.left + width;
-		appRect.bottom = appRect.top + height;
+		RECT appRect = DockRects[i];
 
 		if (SelectedApp == app) {
 			selectedRect = appRect;
@@ -1604,28 +1746,13 @@ static struct app *GetAppForPosition(i32 x, i32 y)
 	// Iteration logic copy/pasted from RedrawSwitcher, so if something changes
 	// there update this:
 
-	u32 ICON_WIDTH = DrawingDims.iconSize;
 	u32 ICON_PAD   = DrawingDims.iconHorzMargin;
-	u32 HORZ_PAD   = DrawingDims.switcherHorzMargin;
-	u32 VERT_PAD   = DrawingDims.switcherVertMargin;
 
-	for (int i = 0; i < AppsCount; i++) {
+	// Same layout as the last redraw (the magnified one)
+	for (int i = 0; i < AppsCount && i < countof(DockRects); i++) {
 		struct app *app = &Apps[i];
 
-		// Special-case math for index 0
-		i32  left0 = i == 0 ? ICON_PAD : 0;
-		i32 right0 = i != 0 ? ICON_PAD : 0;
-
-		i32  icons = (ICON_PAD + ICON_WIDTH + ICON_PAD) * i;
-		i32  width = ICON_WIDTH;
-		i32 height = ICON_WIDTH;
-
-		RECT appRect = {0};
-
-		appRect.left   = HORZ_PAD + left0 + icons + right0;
-		appRect.top    = VERT_PAD;
-		appRect.right  = appRect.left + width;
-		appRect.bottom = appRect.top + height;
+		RECT appRect = DockRects[i];
 
 		// This is specific to GetAppForPosition
 		// Ignore padding for mouse selection, for uSaBiLiTy
@@ -1644,6 +1771,9 @@ static struct app *GetAppForPosition(i32 x, i32 y)
 
 static void ShowSwitcher(void)
 {
+	if (!IsWindowVisible(Switcher)) {
+		DockOpen(); // Opening (not a later Tab): glide in from the app in front
+	}
 	///*dbg*/i64 start = StartMeasuring();
 	RedrawSwitcher();
 	///*dbg*/Print(L"RedrawSwitcher %llims elapsed\n", FinishMeasuring(start));
@@ -1674,6 +1804,7 @@ static void ShowSelectedWindow(void)
 static void HideSwitcher(void)
 {
 	Log(L"cancel/close\n");
+	DockStopTimer();
 	HideWindow(Switcher);
 	LockSetForegroundWindow(LSFW_UNLOCK);
 	// Reset selection
@@ -2140,6 +2271,9 @@ static LRESULT CALLBACK SwitcherWindowProcedure(HWND hwnd, UINT message, WPARAM 
 	    	return OnSwitcherDPIChanged(LOWORD(wparam), *(RECT*)lparam);
 		case WM_PAINT:
 			return OnSwitcherPaint();
+		case WM_TIMER:
+			if (wparam == DOCK_TIMER_ID) return OnSwitcherTimer();
+			return DefWindowProcW(hwnd, message, wparam, lparam);
 		case WM_ACTIVATEAPP:
 			return OnSwitcherFocusChange(wparam != WA_INACTIVE);
 		case WM_MOUSEMOVE:
