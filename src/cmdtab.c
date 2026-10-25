@@ -832,6 +832,19 @@ static f32         DockFrom, DockTo;// Glide endpoints
 static f32         DockMag;         // 0..1, how much of the magnification is applied (for the pop-in)
 static u32         DockMoveStart;   // timeGetTime() when the current glide began
 static u32         DockPopStart;    // timeGetTime() when the pop-in began
+#define WM_SLIDE_DONE (WM_APP + 1)
+#define SLIDE_MS 230
+static handle      SlideOverlay;    // Layered, click-through window that shows the snapshot while it slides
+static handle      SlideFromWindow; // Window that was in front when Alt-Tab began
+static RECT        SlideRect;       // Its on-screen bounds
+static HDC         SlideContext;    // Snapshot of SlideRect
+static HBITMAP     SlideBitmap;
+static HGDIOBJ     SlideOldBitmap;
+static u32         SlideStart;
+static bool        SlideAnimating;
+static handle      SlideThread;     // Runs the frames (see SlideThreadProcedure)
+static volatile LONG SlideCancel;
+static u32         SlideGeneration; // Tells a finished slide's report from a later slide's
 static bool        DockAnimating;   // Is the animation timer running?
 static RECT        DockRects[128];  // Icon rectangles of the last layout, parallel to 'Apps'
 
@@ -864,7 +877,7 @@ static void InitConfig(void)
 		.switcherVertMargin      = 24,
 		.iconSize                = 48,
 		.iconHorzMargin          =  6,
-		.fontSize                = 14,
+		.fontSize                = 12,
 		// Blacklist
 		.blacklist = {
 			{ null,                       L"ApplicationFrameWindow" },
@@ -944,6 +957,18 @@ static void InitSwitcherWindow(handle instance)
 	// Rounded window corners
 	DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
 	DwmSetWindowAttribute(Switcher, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof corners);
+
+	// Slide overlay: never activates, ignores the mouse, hidden from Alt-Tab
+	WNDCLASSEXW slideClass = {0};
+	slideClass.cbSize = sizeof slideClass;
+	slideClass.lpfnWndProc = DefWindowProcW;
+	slideClass.hInstance = instance;
+	slideClass.lpszClassName = L"cmdtabSlide";
+	SlideOverlay = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+	                               MAKEINTATOM(RegisterClassExW(&slideClass)), null, WS_POPUP, 0, 0, 0, 0, null, null, instance, null);
+	// Square corners and no shadow, so the snapshot lines up with the window under it
+	DWM_WINDOW_CORNER_PREFERENCE square = DWMWCP_DONOTROUND;
+	DwmSetWindowAttribute(SlideOverlay, DWMWA_WINDOW_CORNER_PREFERENCE, &square, sizeof square);
 }
 
 static int RunCmdTab(handle instance, u16 *args)
@@ -1625,6 +1650,128 @@ static void DockFollowSelection(void)
 	}
 }
 
+// ========================================
+// Slide: when switching apps, a snapshot of the window being left slides off
+// to the left and fades out, uncovering the newly activated window
+// ========================================
+
+static f32 SlideEase(f32 t) // Ease-out cubic: moves at once, settles softly
+{
+	if (t >= 1) return 1;
+	return 1 - powf(1 - t, 3);
+}
+
+// Frames run on their own thread, paced by DwmFlush (one frame per display
+// refresh) instead of WM_TIMER, which only fires about every 16 ms
+static DWORD WINAPI SlideThreadProcedure(LPVOID param)
+{
+	u32 generation = (u32)(uintptr_t)param;
+	i32 w = SlideRect.right - SlideRect.left;
+	while (!SlideCancel) {
+		f32 t = (timeGetTime() - SlideStart) / (f32)SLIDE_MS;
+		if (t >= 1) break;
+		POINT pos = {SlideRect.left - (i32)(w * SlideEase(t)), SlideRect.top};
+		f32 fade = (1 - t) / 0.6f; // Fully opaque for the first 40%, then fades out
+		BLENDFUNCTION blend = {AC_SRC_OVER, 0, (BYTE)(255 * (fade > 1 ? 1 : fade)), 0};
+		UpdateLayeredWindow(SlideOverlay, null, &pos, null, null, null, 0, &blend, ULW_ALPHA); // Moves and fades without re-sending the bitmap
+		DwmFlush();
+	}
+	PostMessageW(Switcher, WM_SLIDE_DONE, generation, 0);
+	return 0;
+}
+
+static void SlideStopThread(void)
+{
+	if (SlideAnimating) {
+		InterlockedExchange(&SlideCancel, 1);
+		WaitForSingleObject(SlideThread, 100);
+		CloseHandle(SlideThread);
+		SlideThread = null;
+		timeEndPeriod(1);
+		SlideAnimating = false;
+	}
+}
+
+// Ends a running slide and forgets the snapshot
+static void SlideDiscard(void)
+{
+	SlideStopThread();
+	if (SlideOverlay) ShowWindow(SlideOverlay, SW_HIDE);
+	if (SlideBitmap) {
+		SelectObject(SlideContext, SlideOldBitmap);
+		DeleteObject(SlideBitmap);
+		DeleteDC(SlideContext);
+		SlideBitmap = null;
+		SlideContext = null;
+	}
+	SlideFromWindow = null;
+}
+
+// Snapshot the on-screen area of the foreground window, before the switcher covers it
+static void SlideCapture(handle hwnd)
+{
+	SlideDiscard();
+	if (!hwnd || IsIconic(hwnd)) return;
+
+	RECT r;
+	if (DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof r) != S_OK) {
+		GetWindowRect(hwnd, &r);
+	}
+	MONITORINFO mi = {.cbSize = sizeof mi};
+	GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+	if (!IntersectRect(&r, &r, &mi.rcMonitor)) return;
+
+	i32 w = r.right - r.left, h = r.bottom - r.top;
+	HDC screen = GetDC(null);
+	SlideContext = CreateCompatibleDC(screen);
+	SlideBitmap = CreateCompatibleBitmap(screen, w, h);
+	SlideOldBitmap = SelectObject(SlideContext, SlideBitmap);
+	BitBlt(SlideContext, 0, 0, w, h, screen, r.left, r.top, SRCCOPY);
+	ReleaseDC(null, screen);
+
+	SlideFromWindow = hwnd;
+	SlideRect = r;
+}
+
+// Called just before 'target' is activated: put the snapshot on screen where
+// the old window is, then let the timer slide it away
+static void SlideBegin(handle target)
+{
+	if (!SlideBitmap || SlideAnimating) return;
+	if (GetAppHost(target) == SlideFromWindow || target == SlideFromWindow) {
+		SlideDiscard(); // Same window, nothing to uncover
+		return;
+	}
+
+	i32 w = SlideRect.right - SlideRect.left, h = SlideRect.bottom - SlideRect.top;
+	POINT pos = {SlideRect.left, SlideRect.top}, zero = {0, 0};
+	SIZE size = {w, h};
+	BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, 0};
+	SetWindowPos(SlideOverlay, HWND_TOPMOST, pos.x, pos.y, w, h, SWP_NOACTIVATE);
+	UpdateLayeredWindow(SlideOverlay, null, &pos, &size, SlideContext, &zero, 0, &blend, ULW_ALPHA);
+	ShowWindow(SlideOverlay, SW_SHOWNOACTIVATE);
+
+	SlideStart = timeGetTime();
+	timeBeginPeriod(1);
+	SlideCancel = 0;
+	SlideGeneration++;
+	SlideThread = CreateThread(null, 0, SlideThreadProcedure, (LPVOID)(uintptr_t)SlideGeneration, 0, null);
+	SlideAnimating = SlideThread != null;
+	if (!SlideAnimating) {
+		timeEndPeriod(1);
+		SlideDiscard();
+	}
+}
+
+// The slide thread finished; ignore reports from slides that were already cancelled
+static i64 OnSlideDone(u32 generation)
+{
+	if (SlideAnimating && generation == SlideGeneration) {
+		SlideDiscard();
+	}
+	return 0;
+}
+
 static void RedrawSwitcher(void);
 
 static i64 OnSwitcherTimer(void)
@@ -1805,6 +1952,7 @@ static void HideSwitcher(void)
 {
 	Log(L"cancel/close\n");
 	DockStopTimer();
+	if (!SlideAnimating) SlideDiscard(); // Cancelled (Esc etc.): the snapshot isn't needed
 	HideWindow(Switcher);
 	LockSetForegroundWindow(LSFW_UNLOCK);
 	// Reset selection
@@ -1892,7 +2040,11 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				goto passMessage;
 			}
 			SelectFirstApp(); // Initialize selection
+			SlideDiscard(); // A slide still running from the last switch ends here
 			if (*SelectedWindow == GetCoreWindow(GetForegroundWindow())) { // Don't select next when on blank desktop
+				if (!Config.fastSwitchingForApps) {
+					SlideCapture(GetForegroundWindow());
+				}
 				SelectNextApp(shiftHeld, !keyRepeat || !Config.wrapbump);
 			}
 			if (Config.fastSwitchingForApps) {
@@ -1943,6 +2095,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			// After much experimentation it seems to work best to consume
 			// these mod keyups and manually inject mod keyups. I dunno why.
 			SendModKeysUp();
+			SlideBegin(*SelectedWindow);
 			ShowSelectedWindow();
 			HideSwitcher();
 			goto consumeMessage;
@@ -1996,6 +2149,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 
 			// Alt-Enter - switch to selected window
 			if (enterUp) {
+				SlideBegin(*SelectedWindow);
 				ShowSelectedWindow();
 				HideSwitcher();
 				goto consumeMessage;
@@ -2240,6 +2394,7 @@ static i64 OnSwitcherMouseUp(void)
 		SelectedWindow = &SelectedApp->windows[0];
 		/*dbg*/Log(L"select app ");
 		/*dbg*/LogWindow(*SelectedWindow);
+		SlideBegin(*SelectedWindow);
 		ShowSelectedWindow();
 		HideSwitcher();
 	}
@@ -2274,6 +2429,8 @@ static LRESULT CALLBACK SwitcherWindowProcedure(HWND hwnd, UINT message, WPARAM 
 		case WM_TIMER:
 			if (wparam == DOCK_TIMER_ID) return OnSwitcherTimer();
 			return DefWindowProcW(hwnd, message, wparam, lparam);
+		case WM_SLIDE_DONE:
+			return OnSlideDone((u32)wparam);
 		case WM_ACTIVATEAPP:
 			return OnSwitcherFocusChange(wparam != WA_INACTIVE);
 		case WM_MOUSEMOVE:
