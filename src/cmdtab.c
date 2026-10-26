@@ -809,6 +809,7 @@ static handle     *SelectedWindow;  // Currently selected window in switcher. No
 static handle      Switcher;        // Handle for main window (aka. switcher)
 static handle      DrawingContext;  // Drawing context for double-buffered drawing of switcher window
 static handle      DrawingBitmap;   // Off-screen bitmap used for double-buffered drawing of switcher
+static u32        *DrawingPixels;   // DrawingBitmap's pixels (BGRA, top-down), for the glass alpha pass
 static struct gui  DrawingDims;     // Scaled dimensions of GUI elements. Updated on resize
 static HBRUSH      DrawingBg;       // Window background
 static HBRUSH      SelectionBg;     // Selection background
@@ -939,6 +940,145 @@ static void InitKeyboardHook(void)
 {
 	// Install keyboard hook
 	KeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHookProcedure, null, 0);
+}
+
+//================
+// Glass background
+//================
+
+// Windows' own blur-behind isn't rendered on this machine, so the glass is
+// made here: when the switcher opens, the screen behind it is captured once,
+// blurred, tinted, bent at the edges like a lens, and given a sheen and rim.
+// Each redraw starts from that image instead of a flat fill.
+
+static u32 *GlassBack;              // Finished glass background (BGRX, top-down), same size as DrawingBitmap
+static i32  GlassBackW, GlassBackH;
+
+static void GlassBoxBlur(u32 *src, u32 *dst, i32 w, i32 h, i32 r, bool vertical) // One box pass, clamped edges
+{
+	i32 n = vertical ? h : w, lines = vertical ? w : h;
+	iz step = vertical ? w : 1, lineStep = vertical ? 1 : w;
+	for (i32 l = 0; l < lines; l++) {
+		u32 *s = src + l * lineStep, *d = dst + l * lineStep;
+		i32 sum[3] = {0};
+		for (i32 i = -r; i <= r; i++) {
+			u32 p = s[(i < 0 ? 0 : i >= n ? n - 1 : i) * step];
+			sum[0] += p & 0xFF; sum[1] += p >> 8 & 0xFF; sum[2] += p >> 16 & 0xFF;
+		}
+		i32 count = 2 * r + 1;
+		for (i32 i = 0; i < n; i++) {
+			d[i * step] = (sum[2] / count) << 16 | (sum[1] / count) << 8 | (sum[0] / count);
+			i32 out = i - r, in = i + r + 1;
+			u32 po = s[(out < 0 ? 0 : out) * step], pi = s[(in >= n ? n - 1 : in) * step];
+			sum[0] += (i32)(pi & 0xFF) - (i32)(po & 0xFF);
+			sum[1] += (i32)(pi >> 8 & 0xFF) - (i32)(po >> 8 & 0xFF);
+			sum[2] += (i32)(pi >> 16 & 0xFF) - (i32)(po >> 16 & 0xFF);
+		}
+	}
+}
+
+static void GlassCapture(void)
+{
+	i32 w = DrawingDims.drawRect.right - DrawingDims.drawRect.left;
+	i32 h = DrawingDims.drawRect.bottom - DrawingDims.drawRect.top;
+	if (w <= 0 || h <= 0) return;
+	if (GlassBackW != w || GlassBackH != h) {
+		free(GlassBack);
+		GlassBack = malloc((iz)w * h * 4);
+		GlassBackW = GlassBack ? w : 0;
+		GlassBackH = GlassBack ? h : 0;
+		if (!GlassBack) return;
+	}
+	u32 *shot = malloc((iz)w * h * 4), *tmp = malloc((iz)w * h * 4);
+	if (!shot || !tmp) { free(shot); free(tmp); GlassBackW = GlassBackH = 0; return; }
+
+	// Screen behind the (still hidden) switcher
+	handle screen = GetDC(null);
+	handle context = CreateCompatibleDC(screen);
+	BITMAPINFO bmi = {0};
+	bmi.bmiHeader.biSize = sizeof bmi.bmiHeader; bmi.bmiHeader.biWidth = w; bmi.bmiHeader.biHeight = -h;
+	bmi.bmiHeader.biPlanes = 1; bmi.bmiHeader.biBitCount = 32; bmi.bmiHeader.biCompression = BI_RGB;
+	u32 *bits = null;
+	handle bitmap = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, (void **)&bits, null, 0);
+	handle old = SelectObject(context, bitmap);
+	BitBlt(context, 0, 0, w, h, screen, DrawingDims.drawRect.left, DrawingDims.drawRect.top, SRCCOPY);
+	GdiFlush();
+	memcpy(shot, bits, (iz)w * h * 4);
+	SelectObject(context, old);
+	DeleteObject(bitmap);
+	DeleteDC(context);
+	ReleaseDC(null, screen);
+
+	// Frosted: three box passes each way approximate a Gaussian blur
+	i32 r = DrawingDims.drawScale * 10;
+	for (int pass = 0; pass < 3; pass++) {
+		GlassBoxBlur(shot, tmp, w, h, r, false);
+		GlassBoxBlur(tmp, shot, w, h, r, true);
+	}
+
+	// Brighter backdrops get more dark tint, so the white app names stay readable
+	f32 luma = 0;
+	for (iz i = 0; i < (iz)w * h; i += 7) luma += 0.299f * (shot[i] >> 16 & 0xFF) + 0.587f * (shot[i] >> 8 & 0xFF) + 0.114f * (shot[i] & 0xFF);
+	luma /= ((iz)w * h / 7 + 1) * 255.0f;
+	f32 keep = 0.88f - 0.30f * luma; // Share of the backdrop that shows through
+
+	f32 band = DrawingDims.drawScale * 16; // Width of the lens-like bend along the edges
+	i32 rim  = DrawingDims.drawScale + 0.5f; if (rim < 1) rim = 1;
+	for (i32 y = 0; y < h; y++) {
+		f32 t = (f32)y / h;
+		f32 sheen = 0.16f * (1 - t) * (1 - t) * (1 - t); // Light falling on the top of the glass
+		f32 shade = t > 0.6f ? 0.18f * (t - 0.6f) / 0.4f : 0; // Slightly deeper at the bottom, under the app names
+		for (i32 x = 0; x < w; x++) {
+			// Refraction: near an edge, sample from further inside, as a rounded glass edge would
+			f32 dx = 0, dy = 0;
+			f32 dl = x, dr = w - 1 - x, dt = y, db = h - 1 - y;
+			if (dl < band) dx += band * 0.9f * (1 - dl / band) * (1 - dl / band);
+			if (dr < band) dx -= band * 0.9f * (1 - dr / band) * (1 - dr / band);
+			if (dt < band) dy += band * 0.9f * (1 - dt / band) * (1 - dt / band);
+			if (db < band) dy -= band * 0.9f * (1 - db / band) * (1 - db / band);
+			i32 sx = x + (i32)dx, sy = y + (i32)dy;
+			sx = sx < 0 ? 0 : sx >= w ? w - 1 : sx;
+			sy = sy < 0 ? 0 : sy >= h ? h - 1 : sy;
+			u32 p = shot[(iz)sy * w + sx];
+			f32 c[3] = {p >> 16 & 0xFF, p >> 8 & 0xFF, p & 0xFF};
+			// A little extra colour, as light passing through glass picks up
+			f32 grey = 0.299f * c[0] + 0.587f * c[1] + 0.114f * c[2];
+			f32 edgeGlow = 0;
+			f32 d = dl < dr ? dl : dr; d = d < dt ? d : dt; d = d < db ? d : db;
+			if (d < band) edgeGlow = 0.10f * (1 - d / band) * (1 - d / band);
+			bool onRim = d < rim;
+			u32 out = 0;
+			for (int k = 0; k < 3; k++) {
+				f32 v = grey + (c[k] - grey) * 1.3f;
+				v = v * keep * (1 - shade) + 16 * (1 - keep);
+				v += (255 - v) * (sheen + edgeGlow + (onRim ? (y < rim ? 0.55f : 0.28f) : 0));
+				v = v < 0 ? 0 : v > 255 ? 255 : v;
+				out = out << 8 | (u32)(v + 0.5f);
+			}
+			GlassBack[(iz)y * w + x] = out;
+		}
+	}
+	free(shot);
+	free(tmp);
+}
+
+// Selection background: the glass seen through a darker pane, inside a rounded rectangle
+static void GlassDarken(RECT r, i32 radius, f32 amount)
+{
+	if (!DrawingPixels) return;
+	GdiFlush();
+	i32 w = DrawingDims.drawRect.right - DrawingDims.drawRect.left;
+	i32 h = DrawingDims.drawRect.bottom - DrawingDims.drawRect.top;
+	f32 cr = radius / 2.0f; // RoundRect takes the corner ellipse's size, not its radius
+	for (i32 y = r.top < 0 ? 0 : r.top; y < r.bottom && y < h; y++) {
+		for (i32 x = r.left < 0 ? 0 : r.left; x < r.right && x < w; x++) {
+			f32 ex = x < r.left + cr ? r.left + cr - x : x > r.right - 1 - cr ? x - (r.right - 1 - cr) : 0;
+			f32 ey = y < r.top + cr ? r.top + cr - y : y > r.bottom - 1 - cr ? y - (r.bottom - 1 - cr) : 0;
+			if (ex * ex + ey * ey > cr * cr) continue;
+			u32 p = DrawingPixels[(iz)y * w + x];
+			DrawingPixels[(iz)y * w + x] = (u32)((p >> 16 & 0xFF) * (1 - amount)) << 16 | (u32)((p >> 8 & 0xFF) * (1 - amount)) << 8 | (u32)((p & 0xFF) * (1 - amount));
+		}
+	}
 }
 
 static void InitSwitcherWindow(handle instance)
@@ -1451,7 +1591,15 @@ static void ResizeSwitcher(void)
 		DeleteDC(DrawingContext);
 		DrawingContext = CreateCompatibleDC(context);
 		DeleteObject(DrawingBitmap);
-		DrawingBitmap = CreateCompatibleBitmap(context, DrawingDims.drawRect.right - DrawingDims.drawRect.left, DrawingDims.drawRect.bottom - DrawingDims.drawRect.top);
+		// 32-bit top-down DIB so GlassFinish can write per-pixel alpha
+		BITMAPINFO bmi = {0};
+		bmi.bmiHeader.biSize        = sizeof bmi.bmiHeader;
+		bmi.bmiHeader.biWidth       = w;
+		bmi.bmiHeader.biHeight      = -(i32)h;
+		bmi.bmiHeader.biPlanes      = 1;
+		bmi.bmiHeader.biBitCount    = 32;
+		bmi.bmiHeader.biCompression = BI_RGB;
+		DrawingBitmap = CreateDIBSection(context, &bmi, DIB_RGB_COLORS, (void **)&DrawingPixels, null, 0);
 		handle oldBitmap = (handle)SelectObject(DrawingContext, DrawingBitmap);
 		DeleteObject(oldBitmap);
 		ReleaseDC(Switcher, context);
@@ -1499,17 +1647,19 @@ static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 	}
 	HPEN oldPen = (HPEN)SelectObject(DrawingContext, foregroundPen);
 
-	if (isSelected) {
-		// Draw selection rectangle and icon, with selection background and rectangle
-		RoundRect(DrawingContext, appRect.left - SEL_VERT_OFF, appRect.top - SEL_HORZ_OFF, appRect.right + SEL_VERT_OFF, appRect.bottom + SEL_HORZ_OFF, SEL_RADIUS, SEL_RADIUS);
-		DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, backgroundBrush, DI_NORMAL);
-	} else if (isMouseover) {
-		// Draw selection rectangle and icon, with selection background and mouseover rectangle
-		RoundRect(DrawingContext, appRect.left - SEL_VERT_OFF, appRect.top - SEL_HORZ_OFF, appRect.right + SEL_VERT_OFF, appRect.bottom + SEL_HORZ_OFF, SEL_RADIUS, SEL_RADIUS);
-		DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, backgroundBrush, DI_NORMAL);
+	RECT selRect = {appRect.left - SEL_VERT_OFF, appRect.top - SEL_HORZ_OFF, appRect.right + SEL_VERT_OFF, appRect.bottom + SEL_HORZ_OFF};
+	if (isSelected || isMouseover) {
+		// Draw selection rectangle (darker glass with the outline pen) and icon
+		bool glass = GlassBack != null && backgroundBrush == SelectionBg;
+		if (glass) {
+			GlassDarken(selRect, SEL_RADIUS, 0.45f);
+			SelectObject(DrawingContext, GetStockObject(NULL_BRUSH));
+		}
+		RoundRect(DrawingContext, selRect.left, selRect.top, selRect.right, selRect.bottom, SEL_RADIUS, SEL_RADIUS);
+		DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, glass ? null : backgroundBrush, DI_NORMAL);
 	} else {
-		// Draw icon with window background
-		DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, backgroundBrush, DI_NORMAL);
+		// Draw icon straight onto the background (the glass shows around its edges)
+		DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, GlassBack ? null : backgroundBrush, DI_NORMAL);
 	}
 
 	if ((isSelected && !hasMouseover) || isMouseover) {
@@ -1828,8 +1978,13 @@ static void RedrawSwitcher(void)
 	RECT windowRect = {0};
 	GetClientRect(Switcher, &windowRect);
 
-	// Fill window background
-	FillRect(DrawingContext, &windowRect, DrawingBg);
+	// Fill window background: the glass if it was captured at this size, else flat
+	if (GlassBack && DrawingPixels && GlassBackW == windowRect.right && GlassBackH == windowRect.bottom) {
+		GdiFlush();
+		memcpy(DrawingPixels, GlassBack, (iz)GlassBackW * GlassBackH * 4);
+	} else {
+		FillRect(DrawingContext, &windowRect, DrawingBg);
+	}
 
 	// Select text font for DrawTextW (used to draw title text)
 	// Windows 11 UI font, sized for the monitor's DPI (recreated when the scale changes)
@@ -1920,6 +2075,7 @@ static void ShowSwitcher(void)
 {
 	if (!IsWindowVisible(Switcher)) {
 		DockOpen(); // Opening (not a later Tab): glide in from the app in front
+		GlassCapture(); // While hidden, so the glass shows what's behind it
 	}
 	///*dbg*/i64 start = StartMeasuring();
 	RedrawSwitcher();
