@@ -1,3 +1,26 @@
+# cmdtab — Doruk's fork
+
+A fork of [stianhoiland/cmdtab](https://github.com/stianhoiland/cmdtab) v1.7 with a more macOS-like look and feel. Each change is its own commit on this branch (`doruk`), so you can see exactly what it does:
+
+| Change | What it does |
+|---|---|
+| Smaller switcher, Store app names | Switcher 25% smaller; Store apps (e.g. WhatsApp) show their real name and icon |
+| Dock magnification | The selected icon grows to 1.3× and its neighbours less, gliding between selections like the macOS Dock |
+| Accent outline, Windows 11 font | Selection outline follows the Windows accent colour live; app names in Segoe UI Variable, DPI-aware |
+| Slide on switch | The previous window slides off to the left and fades as the new one takes its place, synced to the display's refresh rate |
+| Liquid glass | The switcher's background is a blurred, tinted, lens-edged view of what's behind it |
+
+Upstream has since reorganised its files (`main`), so these changes stay on top of v1.7.
+
+**Build** (with [w64devkit](https://github.com/skeeto/w64devkit)):
+
+```
+windres res/cmdtab.rc -o res/cmdtab.o
+gcc -std=c99 -Os -DNDEBUG=1 -mwindows -s -o cmdtab.exe src/cmdtab.c res/cmdtab.o -lole32 -lcomctl32 -lgdi32 -lshlwapi -ldwmapi -lpathcch -lversion -lwinmm -lshcore
+```
+
+---
+
 # cmdtab
 Fast and super lightweight macOS-style Alt-Tab app/window switcher replacement for Windows, written in the Lord's language, C.
 
