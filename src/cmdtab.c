@@ -712,15 +712,19 @@ static void CloseWindowX(handle hwnd) // CloseWindow already taken
 	PostMessageW(hwnd, WM_CLOSE, 0, 0);
 }
 
-static void TerminateWindowProcess(handle hwnd)
+static bool TerminateWindowProcess(handle hwnd)
 {
 	ULONG pid;
 	GetWindowThreadProcessId(hwnd, &pid);
-	handle process = OpenProcess(PROCESS_TERMINATE, false, pid); // NOTE See GetProcessHandleFromHwnd
-	if (!process || process == INVALID_HANDLE_VALUE || !TerminateProcess(process, 0)) {
+	handle process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, false, pid); // NOTE See GetProcessHandleFromHwnd
+	bool terminated = process && process != INVALID_HANDLE_VALUE && TerminateProcess(process, 0);
+	if (!terminated) {
 		Log(L"ERROR couldn't terminate process with pid: %u\n", pid);
+	} else {
+		WaitForSingleObject(process, 50); // TerminateProcess is asynchronous; a short wait (we're in the keyboard hook) usually covers it
 	}
 	if (process) CloseHandle(process);
+	return terminated;
 }
 
 static u32 GetDpiForMouseMonitor(void)
@@ -848,6 +852,15 @@ static volatile LONG SlideCancel;
 static u32         SlideGeneration; // Tells a finished slide's report from a later slide's
 static bool        DockAnimating;   // Is the animation timer running?
 static RECT        DockRects[128];  // Icon rectangles of the last layout, parallel to 'Apps'
+// Pop: an app closed with Alt-Q swells and shrinks away while its gap closes
+#define POP_MS          260
+static handle      PopIcon;         // Copy of the closed app's icon (app icons are destroyed on slot reuse)
+static int         PopIndex = -1;   // Where its gap sits in 'Apps' (before this index); -1 when no pop is running
+static f32         PopScale;        // Its magnification when it was closed
+static u32         PopStart;
+static RECT        PopRect;         // Where to draw it this frame (set by DockLayout)
+static ULONG       DyingPid;        // Process just terminated with Alt-Q: its windows are left out of
+static u32         DyingUntil;      // the app list until this time, even if Windows still lists them
 
 
 //================
@@ -1394,6 +1407,30 @@ static BOOL CALLBACK _AddToApps(HWND hwnd, LPARAM lparam)
 	return true; // Return true to continue EnumWindows
 }
 
+// Drops the windows of 'pid' from 'Apps'; an app left without windows moves
+// past the end of the list (swapped, not overwritten, so its icon handle
+// stays owned by exactly one slot)
+static void RemoveProcessWindows(ULONG pid)
+{
+	for (int i = 0; i < AppsCount; i++) {
+		struct app *app = &Apps[i];
+		iz kept = 0;
+		for (iz j = 0; j < app->windowsCount; j++) {
+			ULONG owner = 0;
+			GetWindowThreadProcessId(app->windows[j], &owner);
+			if (owner != pid) app->windows[kept++] = app->windows[j];
+		}
+		app->windowsCount = kept;
+		if (kept == 0) {
+			struct app removed = *app;
+			memmove(&Apps[i], &Apps[i+1], (AppsCount - i - 1) * sizeof *app);
+			Apps[AppsCount-1] = removed;
+			AppsCount--;
+			i--;
+		}
+	}
+}
+
 static void UpdateApps(void)
 {
 	// Rebuild the whole window list and measure how long it takes
@@ -1412,6 +1449,9 @@ static void UpdateApps(void)
 	AddToHistory(GetForegroundWindow()); // "Activate" foreground window to record it in window activation history
 	for (int i = HistoryCount-1; i >= 0; i--) {
 		ActivateWindow(History[i]);
+	}
+	if (DyingPid && (i32)(DyingUntil - timeGetTime()) > 0) {
+		RemoveProcessWindows(DyingPid);
 	}
 	Print(L"UpdateApps (%i windows) %llims elapsed\n", windowsCount, FinishMeasuring(start));
 	PrintApps();
@@ -1739,14 +1779,36 @@ static void DockLayout(void)
 	u32 VERT_PAD   = DrawingDims.switcherVertMargin;
 	i32 windowWidth = DrawingDims.drawRect.right - DrawingDims.drawRect.left;
 
-	f32 rowWidth = 0;
+	// A closed app's slot narrows to nothing while its icon pops
+	f32 gap = 0, popSize = 0;
+	if (PopIndex >= 0) {
+		f32 t = (timeGetTime() - PopStart) / (f32)POP_MS;
+		t = t < 0 ? 0 : t > 1 ? 1 : t;
+		// Swell to 118% in the first 30%, then shrink away, faster towards the end
+		f32 grow = t < 0.3f ? 1 + 0.18f * DockEase(t / 0.3f) : 1.18f * (1 - ((t - 0.3f) / 0.7f) * ((t - 0.3f) / 0.7f));
+		popSize = ICON_WIDTH * PopScale * grow;
+		// The gap follows the icon (never wider than its slot), so neighbours close in without covering it
+		gap = (ICON_PAD + ICON_WIDTH * PopScale + ICON_PAD) * (grow < 1 ? grow : 1);
+	}
+
+	f32 rowWidth = gap;
 	for (int i = 0; i < AppsCount; i++) {
 		rowWidth += ICON_PAD + ICON_WIDTH * DockScale(i) + ICON_PAD;
 	}
 
 	i32 baseline = VERT_PAD + (i32)(ICON_WIDTH * DockMaxScale);
 	f32 x = (windowWidth - rowWidth) / 2;
-	for (int i = 0; i < AppsCount && i < countof(DockRects); i++) {
+	for (int i = 0; i <= AppsCount && i < countof(DockRects); i++) {
+		if (i == PopIndex) {
+			// The popping icon stays centered in its gap, on the same baseline
+			f32 center = x + gap / 2;
+			PopRect.left   = (i32)(center - popSize / 2 + 0.5f);
+			PopRect.right  = PopRect.left + (i32)(popSize + 0.5f);
+			PopRect.bottom = baseline - (i32)((ICON_WIDTH * PopScale - popSize) / 2);
+			PopRect.top    = PopRect.bottom - (PopRect.right - PopRect.left);
+			x += gap;
+		}
+		if (i == AppsCount) break;
 		i32 size = (i32)(ICON_WIDTH * DockScale(i) + 0.5f);
 		DockRects[i].left   = (i32)(x + ICON_PAD + 0.5f);
 		DockRects[i].right  = DockRects[i].left + size;
@@ -1798,6 +1860,24 @@ static void DockFollowSelection(void)
 		DockMoveStart = timeGetTime();
 		DockStartTimer();
 	}
+}
+
+static void PopEnd(void)
+{
+	if (PopIcon) DestroyIcon(PopIcon);
+	PopIcon = null;
+	PopIndex = -1;
+}
+
+// 'icon' is a copy the pop now owns; 'index' is where the app was in 'Apps'
+static void PopBegin(handle icon, int index, f32 scale)
+{
+	PopEnd(); // A pop still running just finishes early
+	PopIcon = icon;
+	PopIndex = index;
+	PopScale = scale;
+	PopStart = timeGetTime();
+	DockStartTimer();
 }
 
 // ========================================
@@ -1931,7 +2011,10 @@ static i64 OnSwitcherTimer(void)
 	f32 pop  = (now - DockPopStart)  / (f32)DOCK_POP_MS;
 	DockFocus = DockFrom + (DockTo - DockFrom) * DockEase(move);
 	DockMag   = DockEase(pop);
-	if (move >= 1 && pop >= 1) {
+	if (PopIndex >= 0 && now - PopStart >= POP_MS) {
+		PopEnd();
+	}
+	if (move >= 1 && pop >= 1 && PopIndex < 0) {
 		DockFocus = DockTo;
 		DockMag = 1;
 		DockStopTimer();
@@ -2013,6 +2096,11 @@ static void RedrawSwitcher(void)
 	DockFollowSelection();
 	DockLayout();
 	(void)ICON_WIDTH; (void)ICON_PAD; (void)HORZ_PAD; (void)VERT_PAD;
+
+	// The popping icon goes under the others
+	if (PopIndex >= 0 && PopIcon && PopRect.right > PopRect.left) {
+		DrawIconEx(DrawingContext, PopRect.left, PopRect.top, PopIcon, PopRect.right - PopRect.left, PopRect.bottom - PopRect.top, 0, GlassBack ? null : DrawingBg, DI_NORMAL);
+	}
 
 	for (int i = 0; i < AppsCount && i < countof(DockRects); i++) {
 		struct app *app = &Apps[i];
@@ -2108,6 +2196,7 @@ static void HideSwitcher(void)
 {
 	Log(L"cancel/close\n");
 	DockStopTimer();
+	PopEnd();
 	if (!SlideAnimating) SlideDiscard(); // Cancelled (Esc etc.): the snapshot isn't needed
 	HideWindow(Switcher);
 	LockSetForegroundWindow(LSFW_UNLOCK);
@@ -2337,12 +2426,35 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			// Alt-Q - close all windows of selected application
 			if (keyQDown) {
 				//CloseWindows(*SelectedWindow);
-				TerminateWindowProcess(*SelectedWindow);
+				int index = (int)(SelectedApp - Apps);
+				string path = SelectedApp->path;
+				f32 scale = DockScale(index);
+				ULONG pid = 0;
+				GetWindowThreadProcessId(*SelectedWindow, &pid);
+				if (!TerminateWindowProcess(*SelectedWindow)) {
+					goto consumeMessage; // e.g. access denied: leave the switcher as it is
+				}
+				handle icon = CopyIcon(SelectedApp->icon); // Before UpdateApps may reuse the slot
+				// Leave the dying process out even while Windows still lists its windows,
+				// so the app disappears now instead of lingering (and briefly magnifying)
+				DyingPid = pid;
+				DyingUntil = timeGetTime() + 1000;
 				UpdateApps();
-				ResizeSwitcher(); // Since we called UpdateApps above
-				if (SelectedApp == &Apps[AppsCount-1] && AppsCount > 1) {
-					SelectedApp--;
-					SelectedWindow = &SelectedApp->windows[0];
+				if (AppsCount == 0) {
+					if (icon) DestroyIcon(icon);
+					HideSwitcher();
+					goto consumeMessage;
+				}
+				// The window keeps its size (and its glass); the row recenters as the gap closes
+				if (SelectedApp >= &Apps[AppsCount]) {
+					SelectedApp = &Apps[AppsCount-1];
+				}
+				SelectedWindow = &SelectedApp->windows[0];
+				bool gone = index >= AppsCount || !StringsAreEqual(&Apps[index].path, &path);
+				if (gone && icon) {
+					PopBegin(icon, index, scale);
+				} else if (icon) {
+					DestroyIcon(icon); // Other processes of the same app keep it in the list
 				}
 				RedrawSwitcher();
 				goto consumeMessage;
