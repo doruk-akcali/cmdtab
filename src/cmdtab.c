@@ -46,6 +46,7 @@
 #include <appmodel.h> // GetApplicationUserModelId
 #include <shlobj.h> // SHParseDisplayName
 #include <math.h> // cosf, fabsf for the dock magnification
+#include <tlhelp32.h> // CreateToolhelp32Snapshot: parent process of a helper window
 
 #ifndef APPLICATION_USER_MODEL_ID_MAX_LENGTH
 #define APPLICATION_USER_MODEL_ID_MAX_LENGTH 130 // Missing from MinGW's appmodel.h
@@ -712,10 +713,56 @@ static void CloseWindowX(handle hwnd) // CloseWindow already taken
 	PostMessageW(hwnd, WM_CLOSE, 0, 0);
 }
 
+// Some apps draw their window in a helper process that a supervisor restarts as
+// soon as it dies (Steam's steamwebhelper.exe is relaunched by steam.exe). For
+// those, Alt-Q ends the supervisor first, so the app really quits.
+static const wchar_t *const RestartedHelpers[][2] = {
+	{L"steamwebhelper.exe", L"steam.exe"},
+	{L"EpicWebHelper.exe",  L"EpicGamesLauncher.exe"},
+};
+
+static ULONG SupervisorOf(ULONG pid)
+{
+	handle snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) return 0;
+	PROCESSENTRY32W entries[1024];
+	int count = 0;
+	PROCESSENTRY32W entry = {.dwSize = sizeof entry};
+	for (BOOL more = Process32FirstW(snapshot, &entry); more && count < 1024; more = Process32NextW(snapshot, &entry)) {
+		entries[count++] = entry;
+	}
+	CloseHandle(snapshot);
+
+	const wchar_t *supervisor = NULL;
+	ULONG current = pid;
+	for (int depth = 0; depth < 6; depth++) {
+		PROCESSENTRY32W *found = NULL;
+		for (int i = 0; i < count; i++) if (entries[i].th32ProcessID == current) { found = &entries[i]; break; }
+		if (!found) return 0;
+		if (depth == 0) {
+			for (size_t h = 0; h < sizeof RestartedHelpers / sizeof RestartedHelpers[0]; h++) {
+				if (!_wcsicmp(found->szExeFile, RestartedHelpers[h][0])) supervisor = RestartedHelpers[h][1];
+			}
+			if (!supervisor) return 0; // Not a helper: end just this process, as before
+		} else if (!_wcsicmp(found->szExeFile, supervisor)) {
+			return found->th32ProcessID;
+		}
+		current = found->th32ParentProcessID;
+	}
+	return 0;
+}
+
 static bool TerminateWindowProcess(handle hwnd)
 {
 	ULONG pid;
 	GetWindowThreadProcessId(hwnd, &pid);
+	ULONG boss = SupervisorOf(pid);
+	if (boss) {
+		Log(L"ending supervisor %u of helper %u\n", boss, pid);
+		handle supervisor = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, false, boss);
+		if (supervisor && TerminateProcess(supervisor, 0)) WaitForSingleObject(supervisor, 50);
+		if (supervisor) CloseHandle(supervisor);
+	}
 	handle process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, false, pid); // NOTE See GetProcessHandleFromHwnd
 	bool terminated = process && process != INVALID_HANDLE_VALUE && TerminateProcess(process, 0);
 	if (!terminated) {
