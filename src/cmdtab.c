@@ -1013,6 +1013,9 @@ static void InitKeyboardHook(void)
 
 static u32 *GlassBack;              // Finished glass background (BGRX, top-down), same size as DrawingBitmap
 static i32  GlassBackW, GlassBackH;
+static LRESULT CALLBACK PreviewWindowProcedure(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
+static handle Preview;              // Window-preview panel above the switcher (see "Window previews")
+static const COLORREF MultiGlowColor = RGB(170, 105, 255); // Glow around apps with several windows
 
 static void GlassBoxBlur(u32 *src, u32 *dst, i32 w, i32 h, i32 r, bool vertical) // One box pass, clamped edges
 {
@@ -1037,20 +1040,14 @@ static void GlassBoxBlur(u32 *src, u32 *dst, i32 w, i32 h, i32 r, bool vertical)
 	}
 }
 
-static void GlassCapture(void)
+// Makes the finished glass for the on-screen rectangle 'area' into 'out' (its size)
+static bool GlassMake(u32 *out, RECT area, f32 scale)
 {
-	i32 w = DrawingDims.drawRect.right - DrawingDims.drawRect.left;
-	i32 h = DrawingDims.drawRect.bottom - DrawingDims.drawRect.top;
-	if (w <= 0 || h <= 0) return;
-	if (GlassBackW != w || GlassBackH != h) {
-		free(GlassBack);
-		GlassBack = malloc((iz)w * h * 4);
-		GlassBackW = GlassBack ? w : 0;
-		GlassBackH = GlassBack ? h : 0;
-		if (!GlassBack) return;
-	}
+	i32 w = area.right - area.left;
+	i32 h = area.bottom - area.top;
+	if (w <= 0 || h <= 0 || !out) return false;
 	u32 *shot = malloc((iz)w * h * 4), *tmp = malloc((iz)w * h * 4);
-	if (!shot || !tmp) { free(shot); free(tmp); GlassBackW = GlassBackH = 0; return; }
+	if (!shot || !tmp) { free(shot); free(tmp); return false; }
 
 	// Screen behind the (still hidden) switcher
 	handle screen = GetDC(null);
@@ -1061,7 +1058,7 @@ static void GlassCapture(void)
 	u32 *bits = null;
 	handle bitmap = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, (void **)&bits, null, 0);
 	handle old = SelectObject(context, bitmap);
-	BitBlt(context, 0, 0, w, h, screen, DrawingDims.drawRect.left, DrawingDims.drawRect.top, SRCCOPY);
+	BitBlt(context, 0, 0, w, h, screen, area.left, area.top, SRCCOPY);
 	GdiFlush();
 	memcpy(shot, bits, (iz)w * h * 4);
 	SelectObject(context, old);
@@ -1070,7 +1067,7 @@ static void GlassCapture(void)
 	ReleaseDC(null, screen);
 
 	// Frosted: three box passes each way approximate a Gaussian blur
-	i32 r = DrawingDims.drawScale * 10;
+	i32 r = scale * 10;
 	for (int pass = 0; pass < 3; pass++) {
 		GlassBoxBlur(shot, tmp, w, h, r, false);
 		GlassBoxBlur(tmp, shot, w, h, r, true);
@@ -1082,8 +1079,8 @@ static void GlassCapture(void)
 	luma /= ((iz)w * h / 7 + 1) * 255.0f;
 	f32 keep = 0.88f - 0.30f * luma; // Share of the backdrop that shows through
 
-	f32 band = DrawingDims.drawScale * 16; // Width of the lens-like bend along the edges
-	i32 rim  = DrawingDims.drawScale + 0.5f; if (rim < 1) rim = 1;
+	f32 band = scale * 16; // Width of the lens-like bend along the edges
+	i32 rim  = scale + 0.5f; if (rim < 1) rim = 1;
 	for (i32 y = 0; y < h; y++) {
 		f32 t = (f32)y / h;
 		f32 sheen = 0.16f * (1 - t) * (1 - t) * (1 - t); // Light falling on the top of the glass
@@ -1107,36 +1104,90 @@ static void GlassCapture(void)
 			f32 d = dl < dr ? dl : dr; d = d < dt ? d : dt; d = d < db ? d : db;
 			if (d < band) edgeGlow = 0.10f * (1 - d / band) * (1 - d / band);
 			bool onRim = d < rim;
-			u32 out = 0;
+			u32 out_ = 0;
 			for (int k = 0; k < 3; k++) {
 				f32 v = grey + (c[k] - grey) * 1.3f;
 				v = v * keep * (1 - shade) + 16 * (1 - keep);
 				v += (255 - v) * (sheen + edgeGlow + (onRim ? (y < rim ? 0.55f : 0.28f) : 0));
 				v = v < 0 ? 0 : v > 255 ? 255 : v;
-				out = out << 8 | (u32)(v + 0.5f);
+				out_ = out_ << 8 | (u32)(v + 0.5f);
 			}
-			GlassBack[(iz)y * w + x] = out;
+			out[(iz)y * w + x] = out_;
 		}
 	}
 	free(shot);
 	free(tmp);
+	return true;
 }
 
-// Selection background: the glass seen through a darker pane, inside a rounded rectangle
-static void GlassDarken(RECT r, i32 radius, f32 amount)
+static void GlassCapture(void)
 {
-	if (!DrawingPixels) return;
-	GdiFlush();
 	i32 w = DrawingDims.drawRect.right - DrawingDims.drawRect.left;
 	i32 h = DrawingDims.drawRect.bottom - DrawingDims.drawRect.top;
+	if (w <= 0 || h <= 0) return;
+	if (GlassBackW != w || GlassBackH != h) {
+		free(GlassBack);
+		GlassBack = malloc((iz)w * h * 4);
+		GlassBackW = GlassBack ? w : 0;
+		GlassBackH = GlassBack ? h : 0;
+		if (!GlassBack) return;
+	}
+	if (!GlassMake(GlassBack, DrawingDims.drawRect, DrawingDims.drawScale)) {
+		GlassBackW = GlassBackH = 0;
+	}
+}
+
+// The glass seen through a darker pane, inside a rounded rectangle, in any w×h pixel buffer
+static void GlassDarkenOn(u32 *pixels, i32 w, i32 h, RECT r, i32 radius, f32 amount)
+{
+	if (!pixels) return;
+	GdiFlush();
 	f32 cr = radius / 2.0f; // RoundRect takes the corner ellipse's size, not its radius
 	for (i32 y = r.top < 0 ? 0 : r.top; y < r.bottom && y < h; y++) {
 		for (i32 x = r.left < 0 ? 0 : r.left; x < r.right && x < w; x++) {
 			f32 ex = x < r.left + cr ? r.left + cr - x : x > r.right - 1 - cr ? x - (r.right - 1 - cr) : 0;
 			f32 ey = y < r.top + cr ? r.top + cr - y : y > r.bottom - 1 - cr ? y - (r.bottom - 1 - cr) : 0;
 			if (ex * ex + ey * ey > cr * cr) continue;
+			u32 p = pixels[(iz)y * w + x];
+			pixels[(iz)y * w + x] = (u32)((p >> 16 & 0xFF) * (1 - amount)) << 16 | (u32)((p >> 8 & 0xFF) * (1 - amount)) << 8 | (u32)((p & 0xFF) * (1 - amount));
+		}
+	}
+}
+
+// Selection background in the switcher
+static void GlassDarken(RECT r, i32 radius, f32 amount)
+{
+	GlassDarkenOn(DrawingPixels, DrawingDims.drawRect.right - DrawingDims.drawRect.left, DrawingDims.drawRect.bottom - DrawingDims.drawRect.top, r, radius, amount);
+}
+
+// Soft coloured glow hugging the rounded rectangle 'r' (an app with several windows)
+static void GlassGlow(RECT r, i32 radius, i32 spread, COLORREF color, f32 strength)
+{
+	if (!DrawingPixels || spread <= 0) return;
+	GdiFlush();
+	i32 w = DrawingDims.drawRect.right - DrawingDims.drawRect.left;
+	i32 h = DrawingDims.drawRect.bottom - DrawingDims.drawRect.top;
+	f32 cr = (f32)radius;
+	f32 c[3] = {GetRValue(color), GetGValue(color), GetBValue(color)};
+	for (i32 y = r.top - spread < 0 ? 0 : r.top - spread; y < r.bottom + spread && y < h; y++) {
+		for (i32 x = r.left - spread < 0 ? 0 : r.left - spread; x < r.right + spread && x < w; x++) {
+			f32 qx = r.left + cr - x > x - (r.right - 1 - cr) ? r.left + cr - x : x - (r.right - 1 - cr);
+			f32 qy = r.top + cr - y > y - (r.bottom - 1 - cr) ? r.top + cr - y : y - (r.bottom - 1 - cr);
+			f32 d;
+			if (qx > 0 && qy > 0) d = sqrtf(qx * qx + qy * qy) - cr;
+			else d = (qx > qy ? qx : qy) - cr; // Signed distance to the edge: negative inside
+			f32 a;
+			if (d >= spread) continue;
+			if (d >= 0) { f32 t = 1 - d / spread; a = strength * t * t; }
+			else { f32 t = 1 + d / (spread * 0.7f); if (t <= 0) continue; a = strength * t * t; }
 			u32 p = DrawingPixels[(iz)y * w + x];
-			DrawingPixels[(iz)y * w + x] = (u32)((p >> 16 & 0xFF) * (1 - amount)) << 16 | (u32)((p >> 8 & 0xFF) * (1 - amount)) << 8 | (u32)((p & 0xFF) * (1 - amount));
+			u32 out = 0;
+			for (int k = 0; k < 3; k++) {
+				f32 v = (f32)(p >> (16 - 8 * k) & 0xFF);
+				v = 255 - (255 - v) * (1 - a * c[k] / 255); // Screen blend: light added, never darker
+				out = out << 8 | (u32)(v + 0.5f);
+			}
+			DrawingPixels[(iz)y * w + x] = out;
 		}
 	}
 }
@@ -1169,6 +1220,17 @@ static void InitSwitcherWindow(handle instance)
 	// Square corners and no shadow, so the snapshot lines up with the window under it
 	DWM_WINDOW_CORNER_PREFERENCE square = DWMWCP_DONOTROUND;
 	DwmSetWindowAttribute(SlideOverlay, DWMWA_WINDOW_CORNER_PREFERENCE, &square, sizeof square);
+
+	// Window-preview panel: never activates (the switcher keeps the keyboard), hidden from Alt-Tab
+	WNDCLASSEXW previewClass = {0};
+	previewClass.cbSize = sizeof previewClass;
+	previewClass.lpfnWndProc = PreviewWindowProcedure;
+	previewClass.hInstance = instance;
+	previewClass.hCursor = LoadCursorW(null, IDC_ARROW);
+	previewClass.lpszClassName = L"cmdtabPreview";
+	Preview = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+	                          MAKEINTATOM(RegisterClassExW(&previewClass)), null, WS_POPUP, 0, 0, 0, 0, null, null, instance, null);
+	DwmSetWindowAttribute(Preview, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof corners);
 }
 
 static int RunCmdTab(handle instance, u16 *args)
@@ -1198,7 +1260,8 @@ static int RunCmdTab(handle instance, u16 *args)
 	CachePackagedApps(); // Resolve packaged apps' names and icons now, see CachePackagedApp
 
 	// Run message loop
-	for (MSG msg; GetMessageW(&msg, Switcher, 0, 0) > 0;) DispatchMessageW(&msg); // Not handling -1 errors. Whatever
+	// All of this thread's windows (the preview panel gets mouse input too); WM_DESTROY of the switcher ends it
+	for (MSG msg; GetMessageW(&msg, null, 0, 0) > 0;) DispatchMessageW(&msg); // Not handling -1 errors. Whatever
 
 	// Uninstall keyboard & event hooks
 	UnhookWindowsHookEx(KeyboardHook);
@@ -1735,6 +1798,10 @@ static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 	HPEN oldPen = (HPEN)SelectObject(DrawingContext, foregroundPen);
 
 	RECT selRect = {appRect.left - SEL_VERT_OFF, appRect.top - SEL_HORZ_OFF, appRect.right + SEL_VERT_OFF, appRect.bottom + SEL_HORZ_OFF};
+	// Several windows: a purple glow around the icon (on the glass, under the icon)
+	bool glow = GlassBack != null && app->windowsCount > 1;
+	f32 s = DrawingDims.drawScale;
+	RECT glowRect = {appRect.left + (i32)(s * 2), appRect.top + (i32)(s * 2), appRect.right - (i32)(s * 2), appRect.bottom - (i32)(s * 2)};
 	if (isSelected || isMouseover) {
 		// Draw selection rectangle (darker glass with the outline pen) and icon
 		bool glass = GlassBack != null && backgroundBrush == SelectionBg;
@@ -1742,10 +1809,12 @@ static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 			GlassDarken(selRect, SEL_RADIUS, 0.45f);
 			SelectObject(DrawingContext, GetStockObject(NULL_BRUSH));
 		}
+		if (glow) GlassGlow(glowRect, (i32)(width * 0.22f), (i32)(s * 9), MultiGlowColor, 0.85f);
 		RoundRect(DrawingContext, selRect.left, selRect.top, selRect.right, selRect.bottom, SEL_RADIUS, SEL_RADIUS);
 		DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, glass ? null : backgroundBrush, DI_NORMAL);
 	} else {
 		// Draw icon straight onto the background (the glass shows around its edges)
+		if (glow) GlassGlow(glowRect, (i32)(width * 0.22f), (i32)(s * 8), MultiGlowColor, 0.7f);
 		DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, GlassBack ? null : backgroundBrush, DI_NORMAL);
 	}
 
@@ -2050,6 +2119,458 @@ static i64 OnSlideDone(u32 generation)
 }
 
 static void RedrawSwitcher(void);
+static void ShowSelectedWindow(void);
+static void HideSwitcher(void);
+
+// ========================================
+// Window previews: resting on an app with several windows (Tab or mouse) for a
+// moment zooms a glass panel of live window previews out of its icon, above
+// the switcher. Tab walks through those windows before moving on to the next
+// app; Up enters the panel at once, Left/Right move in it, Down goes back to
+// the icon. Hovering a preview selects it, clicking switches to it.
+// ========================================
+
+#define PREVIEW_TIMER_ID 2
+#define PREVIEW_FRAME_MS 8
+#define PREVIEW_DELAY_MS 450         // Rest on an app this long before its windows show
+#define PREVIEW_OPEN_MS  260
+#define PREVIEW_CLOSE_MS 170
+#define PREVIEW_HOVER_MS 130
+#define PREVIEW_MAX      12
+static struct app *PreviewApp;        // App whose windows the panel shows; null while hidden
+static iz          PreviewCount;
+static handle      PreviewWindows[PREVIEW_MAX];
+static bool        PreviewIconic[PREVIEW_MAX];   // Minimized: DWM has no picture, the app icon stands in
+static HTHUMBNAIL  PreviewThumbs[PREVIEW_MAX];
+static RECT        PreviewThumbRects[PREVIEW_MAX];// Picture area of each window, panel coordinates at full size
+static RECT        PreviewCells[PREVIEW_MAX];     // Whole cell (picture and title), for highlight and hit-testing
+static f32         PreviewHot[PREVIEW_MAX];       // 0..1 highlight animation of each cell
+static int         PreviewSel = -1;   // Highlighted window, -1 for none (the app icon itself)
+static f32         PreviewP;          // 0 hidden .. 1 fully open
+static int         PreviewDir;        // +1 opening, -1 closing, 0 at rest
+static bool        PreviewDirty;      // Needs a new frame even at rest
+static u32         PreviewLast;       // timeGetTime() of the last tick
+static u32         PreviewHiddenAt;
+static RECT        PreviewFinal;      // On-screen rectangle when fully open
+static f32         PreviewCurScale = 1;// Current size relative to full, for hit-testing
+static bool        PreviewMouseInside;
+static bool        PreviewTicking;
+static bool        LastInputMouse;    // Was the mouse (not the keyboard) used last? Then the hovered app wins
+static struct app *WantApp;           // App the panel should show, and since when
+static u32         WantSince;
+static bool        WantFromMouse;
+static bool        WantEnterFirst;    // Up was pressed: highlight the first window once open
+static HDC         PreviewDC;         // Full-size frame (glass, highlights, titles), stretched while zooming
+static HBITMAP     PreviewBitmap;
+static HGDIOBJ     PreviewOldBitmap;
+static u32        *PreviewPixels;
+static u32        *PreviewGlass;
+static i32         PreviewW, PreviewH;
+static HFONT       PreviewFont;
+static f32         PreviewFontScale;
+
+static f32 PreviewEase(f32 t) // Ease-out quart: a quick zoom that settles softly, like a macOS window opening
+{
+	if (t <= 0) return 0;
+	if (t >= 1) return 1;
+	f32 u = 1 - t;
+	return 1 - u * u * u * u;
+}
+
+static void PreviewHideNow(void)
+{
+	for (iz i = 0; i < PreviewCount; i++) {
+		if (PreviewThumbs[i]) DwmUnregisterThumbnail(PreviewThumbs[i]);
+		PreviewThumbs[i] = 0;
+	}
+	if (PreviewApp) PreviewHiddenAt = timeGetTime();
+	PreviewCount = 0;
+	PreviewApp = null;
+	PreviewSel = -1;
+	PreviewP = 0;
+	PreviewDir = 0;
+	PreviewMouseInside = false;
+	if (Preview) ShowWindow(Preview, SW_HIDE);
+}
+
+// The app list is about to change (Alt-Q, Alt-W...): forget the panel and what it wanted
+static void PreviewReset(void)
+{
+	PreviewHideNow();
+	WantApp = null;
+	WantEnterFirst = false;
+}
+
+// Center of the app's icon on screen, where the panel grows from and shrinks into
+static POINT PreviewOrigin(void)
+{
+	POINT p = {(PreviewFinal.left + PreviewFinal.right) / 2, PreviewFinal.bottom};
+	if (PreviewApp && PreviewApp >= Apps && PreviewApp < Apps + AppsCount) {
+		RECT r = DockRects[PreviewApp - Apps];
+		p.x = DrawingDims.drawRect.left + (r.left + r.right) / 2;
+		p.y = DrawingDims.drawRect.top + (r.top + r.bottom) / 2;
+	}
+	return p;
+}
+
+static bool PreviewOpen(struct app *app)
+{
+	f32 s = DrawingDims.drawScale;
+	PreviewHideNow();
+	PreviewCount = app->windowsCount < PREVIEW_MAX ? app->windowsCount : PREVIEW_MAX;
+	PreviewApp = app;
+
+	// Live pictures of the windows, and their sizes for the layout
+	f32 aspect[PREVIEW_MAX];
+	for (iz i = 0; i < PreviewCount; i++) {
+		handle hwnd = app->windows[i];
+		PreviewWindows[i] = hwnd;
+		PreviewIconic[i] = IsIconic(GetAppHost(hwnd));
+		PreviewThumbs[i] = 0;
+		aspect[i] = 16 / 10.0f;
+		if (!PreviewIconic[i] && DwmRegisterThumbnail(Preview, GetAppHost(hwnd), &PreviewThumbs[i]) == S_OK) {
+			SIZE size = {0};
+			if (DwmQueryThumbnailSourceSize(PreviewThumbs[i], &size) == S_OK && size.cx > 0 && size.cy > 0) {
+				aspect[i] = (f32)size.cx / size.cy;
+				aspect[i] = aspect[i] < 0.5f ? 0.5f : aspect[i] > 3 ? 3 : aspect[i];
+			}
+		} else {
+			PreviewThumbs[i] = 0;
+		}
+	}
+
+	// Layout: one row of cells, shrunk as a whole if it doesn't fit the monitor
+	MONITORINFO mi = {.cbSize = sizeof mi};
+	GetMonitorInfoW(MonitorFromRect(&DrawingDims.drawRect, MONITOR_DEFAULTTONEAREST), &mi);
+	i32 availW = (mi.rcWork.right - mi.rcWork.left) - (i32)(s * 48);
+	f32 k = 1;
+	i32 pad, gap, inner, titleH, thumbH, w, h;
+	for (int attempt = 0; attempt < 2; attempt++) {
+		pad = s * 14 * k; gap = s * 10 * k; inner = s * 8 * k; titleH = s * 22;
+		thumbH = s * 128 * k;
+		i32 thumbMaxW = s * 228 * k, minW = s * 96 * k;
+		i32 x = pad;
+		for (iz i = 0; i < PreviewCount; i++) {
+			i32 tw = thumbH * aspect[i], th = thumbH;
+			if (tw > thumbMaxW) { tw = thumbMaxW; th = thumbMaxW / aspect[i]; }
+			i32 cw = tw > minW ? tw : minW;
+			PreviewCells[i] = (RECT){x, pad, x + cw + 2 * inner, pad + inner + thumbH + titleH};
+			i32 tx = x + inner + (cw - tw) / 2, ty = pad + inner + (thumbH - th) / 2;
+			PreviewThumbRects[i] = (RECT){tx, ty, tx + tw, ty + th};
+			x += cw + 2 * inner + gap;
+		}
+		w = x - gap + pad;
+		h = pad + inner + thumbH + titleH + pad;
+		if (w <= availW) break;
+		k *= (f32)availW / w;
+	}
+
+	// Centered over the icon, just above the switcher, inside the monitor
+	POINT origin = PreviewOrigin();
+	i32 left = origin.x - w / 2;
+	if (left + w > mi.rcWork.right - (i32)(s * 24)) left = mi.rcWork.right - (i32)(s * 24) - w;
+	if (left < mi.rcWork.left + (i32)(s * 24)) left = mi.rcWork.left + (i32)(s * 24);
+	i32 bottom = DrawingDims.drawRect.top - (i32)(s * 14);
+	if (bottom - h < mi.rcWork.top) bottom = mi.rcWork.top + h;
+	PreviewFinal = (RECT){left, bottom - h, left + w, bottom};
+
+	// Full-size frame buffer and the glass behind the panel's spot (the panel is hidden, so not in the capture)
+	if (PreviewW != w || PreviewH != h || !PreviewBitmap) {
+		if (!PreviewDC) PreviewDC = CreateCompatibleDC(null);
+		if (PreviewBitmap) { SelectObject(PreviewDC, PreviewOldBitmap); DeleteObject(PreviewBitmap); }
+		free(PreviewGlass);
+		BITMAPINFO bmi = {0};
+		bmi.bmiHeader.biSize = sizeof bmi.bmiHeader; bmi.bmiHeader.biWidth = w; bmi.bmiHeader.biHeight = -h;
+		bmi.bmiHeader.biPlanes = 1; bmi.bmiHeader.biBitCount = 32; bmi.bmiHeader.biCompression = BI_RGB;
+		PreviewBitmap = CreateDIBSection(PreviewDC, &bmi, DIB_RGB_COLORS, (void **)&PreviewPixels, null, 0);
+		PreviewOldBitmap = SelectObject(PreviewDC, PreviewBitmap);
+		PreviewGlass = malloc((iz)w * h * 4);
+		PreviewW = PreviewBitmap ? w : 0;
+		PreviewH = PreviewBitmap ? h : 0;
+	}
+	if (!PreviewBitmap || !PreviewGlass) { PreviewHideNow(); return false; }
+	if (timeGetTime() - PreviewHiddenAt < 50) DwmFlush(); // Let a panel that was just hidden leave the screen first
+	if (!GlassMake(PreviewGlass, PreviewFinal, s)) {
+		for (iz i = 0; i < (iz)w * h; i++) PreviewGlass[i] = 0x202020;
+	}
+
+	if (PreviewFont && PreviewFontScale != s) { DeleteObject(PreviewFont); PreviewFont = null; }
+	if (!PreviewFont) {
+		PreviewFont = CreateFontW(-(i32)(s * Config.fontSize + 0.5f), 0, 0, 0, FW_SEMIBOLD, false, false, false,
+		                          DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS,
+		                          L"Segoe UI Variable Text");
+		PreviewFontScale = s;
+	}
+
+	for (iz i = 0; i < PREVIEW_MAX; i++) PreviewHot[i] = 0;
+	PreviewSel = -1;
+	PreviewP = 0;
+	PreviewDir = 1;
+	PreviewDirty = true;
+	Log(L"previews for %s (%i windows)\n", app->title.text, (int)PreviewCount);
+	return true;
+}
+
+// Draws the full-size frame: glass, the highlighted cell's darker pane and outline, titles, icons of minimized windows
+static void PreviewRender(void)
+{
+	f32 s = DrawingDims.drawScale;
+	GdiFlush();
+	memcpy(PreviewPixels, PreviewGlass, (iz)PreviewW * PreviewH * 4);
+	i32 radius = s * 12;
+	for (iz i = 0; i < PreviewCount; i++) {
+		if (PreviewHot[i] > 0.01f) {
+			GlassDarkenOn(PreviewPixels, PreviewW, PreviewH, PreviewCells[i], radius, 0.42f * PreviewHot[i]);
+		}
+	}
+	SetBkMode(PreviewDC, TRANSPARENT);
+	SetTextColor(PreviewDC, RGB(240, 240, 240));
+	HGDIOBJ oldFont = SelectObject(PreviewDC, PreviewFont ? PreviewFont : GetStockObject(DEFAULT_GUI_FONT));
+	COLORREF accent = GetAccentColor() & 0x00FFFFFF;
+	for (iz i = 0; i < PreviewCount; i++) {
+		RECT cell = PreviewCells[i], thumb = PreviewThumbRects[i];
+		f32 hot = PreviewHot[i];
+		if (hot > 0.01f) {
+			// Outline fades in with the highlight, from the dark glass to the accent colour
+			COLORREF c = RGB(28 + (GetRValue(accent) - 28) * hot, 28 + (GetGValue(accent) - 28) * hot, 28 + (GetBValue(accent) - 28) * hot);
+			HPEN pen = CreatePen(PS_SOLID, (i32)(s * 2.5f + 0.5f), c);
+			HGDIOBJ oldPen = SelectObject(PreviewDC, pen);
+			HGDIOBJ oldBrush = SelectObject(PreviewDC, GetStockObject(NULL_BRUSH));
+			RoundRect(PreviewDC, cell.left, cell.top, cell.right, cell.bottom, radius, radius);
+			SelectObject(PreviewDC, oldBrush);
+			SelectObject(PreviewDC, oldPen);
+			DeleteObject(pen);
+		}
+		if (PreviewIconic[i] || !PreviewThumbs[i]) {
+			// No live picture: a dim pane with the app icon in it
+			GlassDarkenOn(PreviewPixels, PreviewW, PreviewH, thumb, (i32)(s * 8), 0.25f);
+			i32 size = (thumb.bottom - thumb.top) / 2;
+			i32 max = s * 48; if (size > max) size = max;
+			DrawIconEx(PreviewDC, (thumb.left + thumb.right - size) / 2, (thumb.top + thumb.bottom - size) / 2, PreviewApp->icon, size, size, 0, null, DI_NORMAL);
+		}
+		string title = GetWindowTitle(PreviewWindows[i]);
+		if (title.length <= 0) title = GetWindowTitle(GetAppHost(PreviewWindows[i]));
+		if (title.length <= 0) title = PreviewApp->title;
+		RECT textRect = {cell.left + (i32)(s * 6), cell.bottom - (i32)(s * 22), cell.right - (i32)(s * 6), cell.bottom - (i32)(s * 2)};
+		DrawTextW(PreviewDC, title.text, -1, &textRect, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+	}
+	SelectObject(PreviewDC, oldFont);
+	GdiFlush();
+}
+
+// Puts the current frame on screen: the panel's rectangle zooms between the icon and its full size
+static void PreviewPresent(void)
+{
+	f32 e = PreviewEase(PreviewP);
+	POINT origin = PreviewOrigin();
+	f32 startScale = DrawingDims.iconSize / (f32)(PreviewH > 0 ? PreviewH : 1);
+	if (startScale < 0.12f) startScale = 0.12f;
+	if (startScale > 0.6f) startScale = 0.6f;
+	f32 scale = startScale + (1 - startScale) * e;
+	f32 cx = origin.x + ((PreviewFinal.left + PreviewFinal.right) / 2.0f - origin.x) * e;
+	f32 cy = origin.y + ((PreviewFinal.top + PreviewFinal.bottom) / 2.0f - origin.y) * e;
+	i32 w = (i32)(PreviewW * scale + 0.5f), h = (i32)(PreviewH * scale + 0.5f);
+	if (w < 2) w = 2;
+	if (h < 2) h = 2;
+	i32 x = (i32)(cx - w / 2.0f), y = (i32)(cy - h / 2.0f);
+	PreviewCurScale = (f32)w / PreviewW;
+
+	bool shown = IsWindowVisible(Preview);
+	SetWindowPos(Preview, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS | (shown ? 0 : SWP_SHOWWINDOW));
+	HDC dc = GetDC(Preview);
+	if (w == PreviewW && h == PreviewH) {
+		BitBlt(dc, 0, 0, w, h, PreviewDC, 0, 0, SRCCOPY);
+	} else {
+		SetStretchBltMode(dc, HALFTONE);
+		SetBrushOrgEx(dc, 0, 0, null);
+		StretchBlt(dc, 0, 0, w, h, PreviewDC, 0, 0, PreviewW, PreviewH, SRCCOPY);
+	}
+	ReleaseDC(Preview, dc);
+	ValidateRect(Preview, null);
+
+	// The live pictures follow the zoom; the highlighted one grows a little; they fade in as the panel opens
+	f32 fade = (e - 0.15f) / 0.55f;
+	fade = fade < 0 ? 0 : fade > 1 ? 1 : fade;
+	for (iz i = 0; i < PreviewCount; i++) {
+		if (!PreviewThumbs[i]) continue;
+		RECT t = PreviewThumbRects[i];
+		f32 grow = 1 + 0.05f * PreviewHot[i];
+		f32 tcx = (t.left + t.right) / 2.0f, tcy = (t.top + t.bottom) / 2.0f;
+		f32 hw = (t.right - t.left) * grow / 2, hh = (t.bottom - t.top) * grow / 2;
+		DWM_THUMBNAIL_PROPERTIES props = {0};
+		props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE | DWM_TNP_SOURCECLIENTAREAONLY;
+		props.rcDestination = (RECT){(LONG)((tcx - hw) * scale), (LONG)((tcy - hh) * scale), (LONG)((tcx + hw) * scale), (LONG)((tcy + hh) * scale)};
+		props.opacity = (BYTE)(255 * fade);
+		props.fVisible = fade > 0;
+		props.fSourceClientAreaOnly = false;
+		DwmUpdateThumbnailProperties(PreviewThumbs[i], &props);
+	}
+}
+
+static struct app *PreviewWanted(void)
+{
+	if (PreviewMouseInside && PreviewApp) return PreviewApp;
+	if (LastInputMouse && MouseApp) return MouseApp;
+	return SelectedApp;
+}
+
+static void PreviewTick(void)
+{
+	u32 now = timeGetTime();
+	u32 dt = now - PreviewLast;
+	PreviewLast = now;
+	if (dt > 50) dt = 50;
+
+	struct app *want = PreviewWanted();
+	if (want != WantApp) {
+		WantApp = want;
+		WantSince = now;
+		WantFromMouse = LastInputMouse;
+		WantEnterFirst = false;
+	}
+	bool settled = now - WantSince >= PREVIEW_DELAY_MS;
+	if (PreviewApp) {
+		if (PreviewApp != WantApp) {
+			// Leaving: at once from the keyboard; from the mouse only once it rests elsewhere (it may be on its way to the panel)
+			if (PreviewDir >= 0 && (!WantFromMouse || settled)) PreviewDir = -1;
+		} else if (PreviewDir < 0) {
+			PreviewDir = 1; // Came back while it was closing: open again from where it is
+		}
+	} else if (WantApp && WantApp->windowsCount > 1 && settled && Config.groupByApp) {
+		PreviewOpen(WantApp);
+	}
+	if (!PreviewApp) return;
+
+	if (WantEnterFirst && PreviewApp == SelectedApp && PreviewDir >= 0) {
+		WantEnterFirst = false;
+		PreviewSel = 0;
+		SelectedWindow = &SelectedApp->windows[0];
+		PreviewDirty = true;
+	}
+
+	bool moving = PreviewDir != 0;
+	if (PreviewDir > 0) {
+		PreviewP += dt / (f32)PREVIEW_OPEN_MS;
+		if (PreviewP >= 1) { PreviewP = 1; PreviewDir = 0; }
+	} else if (PreviewDir < 0) {
+		PreviewP -= dt / (f32)PREVIEW_CLOSE_MS;
+		if (PreviewP <= 0) { PreviewHideNow(); return; }
+	}
+	for (iz i = 0; i < PreviewCount; i++) {
+		f32 target = i == PreviewSel ? 1 : 0;
+		f32 step = dt / (f32)PREVIEW_HOVER_MS;
+		if (PreviewHot[i] < target) { PreviewHot[i] += step; if (PreviewHot[i] > target) PreviewHot[i] = target; moving = true; }
+		else if (PreviewHot[i] > target) { PreviewHot[i] -= step; if (PreviewHot[i] < target) PreviewHot[i] = target; moving = true; }
+	}
+	if (moving || PreviewDirty) {
+		PreviewDirty = false;
+		PreviewRender();
+		PreviewPresent();
+	}
+}
+
+static void PreviewStartTicking(void)
+{
+	if (!PreviewTicking) {
+		timeBeginPeriod(1);
+		SetTimer(Switcher, PREVIEW_TIMER_ID, PREVIEW_FRAME_MS, null);
+		PreviewTicking = true;
+		PreviewLast = timeGetTime();
+		WantApp = null;
+		LastInputMouse = false;
+	}
+}
+
+static void PreviewStopTicking(void)
+{
+	PreviewReset();
+	if (PreviewTicking) {
+		KillTimer(Switcher, PREVIEW_TIMER_ID);
+		timeEndPeriod(1);
+		PreviewTicking = false;
+	}
+}
+
+// Can the keyboard move through the panel's windows right now?
+static bool PreviewNavigable(void)
+{
+	return PreviewApp && PreviewApp == SelectedApp && PreviewDir >= 0;
+}
+
+static void PreviewSetSel(int i)
+{
+	PreviewSel = i;
+	SelectedWindow = &SelectedApp->windows[i < 0 ? 0 : i];
+	PreviewDirty = true;
+}
+
+// Up on an app with several windows: show them without waiting, first one highlighted
+static void PreviewOpenNow(void)
+{
+	WantApp = SelectedApp;
+	WantSince = timeGetTime() - PREVIEW_DELAY_MS;
+	WantFromMouse = false;
+	WantEnterFirst = true;
+}
+
+static int PreviewHit(i32 x, i32 y)
+{
+	if (PreviewCurScale <= 0) return -1;
+	POINT p = {(LONG)(x / PreviewCurScale), (LONG)(y / PreviewCurScale)};
+	for (iz i = 0; i < PreviewCount; i++) {
+		if (PtInRect(&PreviewCells[i], p)) return (int)i;
+	}
+	return -1;
+}
+
+static LRESULT CALLBACK PreviewWindowProcedure(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
+{
+	switch (message) {
+		case WM_MOUSEACTIVATE:
+			return MA_NOACTIVATE;
+		case WM_ERASEBKGND:
+			return 1;
+		case WM_PAINT: {
+			PAINTSTRUCT ps;
+			if (BeginPaint(hwnd, &ps)) EndPaint(hwnd, &ps);
+			if (PreviewApp) PreviewDirty = true; // Next tick redraws it
+			return 0;
+		}
+		case WM_MOUSEMOVE: {
+			TrackMouseEvent(&(TRACKMOUSEEVENT){.cbSize = sizeof(TRACKMOUSEEVENT), .dwFlags = TME_LEAVE, .hwndTrack = hwnd});
+			if (!PreviewApp || PreviewDir < 0) return 0;
+			PreviewMouseInside = true;
+			LastInputMouse = true;
+			int hit = PreviewHit((i16)LOWORD(lparam), (i16)HIWORD(lparam));
+			if (hit >= 0 && (hit != PreviewSel || SelectedApp != PreviewApp)) {
+				// Hovering a window selects it, so releasing Alt switches to it too
+				SelectedApp = PreviewApp;
+				PreviewSetSel(hit);
+				RedrawSwitcher();
+			}
+			SetCursor(LoadCursorW(null, hit >= 0 ? IDC_HAND : IDC_ARROW));
+			return 0;
+		}
+		case WM_MOUSELEAVE:
+			PreviewMouseInside = false;
+			return 0;
+		case WM_LBUTTONUP: {
+			if (!PreviewApp || !SelectedWindow) return 0;
+			int hit = PreviewHit((i16)LOWORD(lparam), (i16)HIWORD(lparam));
+			if (hit < 0) return 0;
+			SelectedApp = PreviewApp;
+			SelectedWindow = &SelectedApp->windows[hit];
+			Log(L"select previewed window ");
+			LogWindow(*SelectedWindow);
+			SlideBegin(*SelectedWindow);
+			ShowSelectedWindow();
+			HideSwitcher();
+			return 0;
+		}
+		default:
+			return DefWindowProcW(hwnd, message, wparam, lparam);
+	}
+}
 
 static i64 OnSwitcherTimer(void)
 {
@@ -2218,6 +2739,7 @@ static void ShowSwitcher(void)
 	ReceiveLastInputEvent();
 	ShowWindowX(Switcher);
 	LockSetForegroundWindow(LSFW_LOCK);
+	PreviewStartTicking(); // Watches for a rest on an app with several windows
 }
 
 static void SendModKeysUp(void)
@@ -2243,6 +2765,7 @@ static void HideSwitcher(void)
 {
 	Log(L"cancel/close\n");
 	DockStopTimer();
+	PreviewStopTicking();
 	PopEnd();
 	if (!SlideAnimating) SlideDiscard(); // Cancelled (Esc etc.): the snapshot isn't needed
 	HideWindow(Switcher);
@@ -2403,13 +2926,40 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 
 			bool key1Down = keyCode == Config.hotkeyForApps.key && keyDown;
 			bool key2Down = keyCode == Config.hotkeyForWindows.key && keyDown;
-			bool prevDown = (keyCode == VK_UP || keyCode == VK_LEFT) && keyDown;
-			bool nextDown = (keyCode == VK_DOWN || keyCode == VK_RIGHT) && keyDown;
+			bool upDown    = keyCode == VK_UP && keyDown;
+			bool downDown  = keyCode == VK_DOWN && keyDown;
+			bool leftDown  = keyCode == VK_LEFT && keyDown;
+			bool rightDown = keyCode == VK_RIGHT && keyDown;
 
 			// Subsequent Alt-Tab - next app (hold Shift for previous)
 			// Also arrow keys, left and right
-			if (key1Down || (nextDown || prevDown)) {
-				SelectNextApp(shiftHeld || prevDown, !keyRepeat || !Config.wrapbump);
+			// With the window previews open, Tab first walks through the
+			// app's windows; Up enters them, Left/Right move, Down leaves
+			if (key1Down || upDown || downDown || leftDown || rightDown) {
+				LastInputMouse = false;
+				bool back = key1Down ? shiftHeld : (leftDown || upDown);
+				bool handled = false;
+				if (PreviewNavigable()) {
+					if (key1Down) {
+						if (!back && PreviewSel < PreviewCount - 1) { PreviewSetSel(PreviewSel + 1); handled = true; }
+						else if (back && PreviewSel >= 0) { PreviewSetSel(PreviewSel - 1); handled = true; }
+					} else if (upDown) {
+						if (PreviewSel < 0) PreviewSetSel(0);
+						handled = true;
+					} else if (downDown) {
+						PreviewSetSel(-1);
+						handled = true;
+					} else if (PreviewSel >= 0) {
+						PreviewSetSel((int)((PreviewSel + (back ? PreviewCount - 1 : 1)) % PreviewCount));
+						handled = true;
+					}
+				} else if (upDown && SelectedApp && SelectedApp->windowsCount > 1 && Config.groupByApp && Config.showSwitcherForApps) {
+					PreviewOpenNow();
+					handled = true;
+				}
+				if (!handled) {
+					SelectNextApp(back, !keyRepeat || !Config.wrapbump);
+				}
 				if (Config.fastSwitchingForApps) {
 					ShowSelectedWindow();
 				}
@@ -2422,7 +2972,12 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			// Subsequent Alt-Tilde/Backquote - next window (hold Shift for previous)
 			// TODO Also arrow keys, up and down
 			if (key2Down) {
+				LastInputMouse = false;
 				SelectNextWindow(shiftHeld, !keyRepeat || !Config.wrapbump);
+				if (PreviewNavigable()) {
+					iz index = SelectedWindow - SelectedApp->windows;
+					if (index < PreviewCount) PreviewSetSel((int)index); // Keep the panel's highlight on the same window
+				}
 				if (Config.fastSwitchingForWindows) {
 					ShowSelectedWindow();
 				}
@@ -2482,6 +3037,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 					goto consumeMessage; // e.g. access denied: leave the switcher as it is
 				}
 				handle icon = CopyIcon(SelectedApp->icon); // Before UpdateApps may reuse the slot
+				PreviewReset(); // The app list changes under it
 				// Leave the dying process out even while Windows still lists its windows,
 				// so the app disappears now instead of lingering (and briefly magnifying)
 				DyingPid = pid;
@@ -2509,6 +3065,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			// Alt-W or Alt-Delete - close selected window
 			if (keyWDown || deleteDown) {
 				CloseWindowX(*SelectedWindow);
+				PreviewReset();
 				UpdateApps();
 				// TODO fix selection
 				ResizeSwitcher(); // Since we called UpdateApps above
@@ -2537,6 +3094,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				handle selectedWindow = *SelectedWindow;
 				Config.groupByApp = !Config.groupByApp;
 				SetRegKey(L"groupByApp", Config.groupByApp);
+				PreviewReset();
 				UpdateApps();
 				ResizeSwitcher(); // Since we have called UpdateApps() above
 				// Find existing app and window
@@ -2673,6 +3231,7 @@ static i64 OnSwitcherMouseMove(i32 x, i32 y)
 	}
 
 	struct app *newMouseApp = GetAppForPosition(MouseX, MouseY);
+	LastInputMouse = true; // The hovered app now decides which windows the previews show
 
 	if (MouseApp != newMouseApp) {
 		MouseApp = newMouseApp;
@@ -2743,6 +3302,7 @@ static LRESULT CALLBACK SwitcherWindowProcedure(HWND hwnd, UINT message, WPARAM 
 			return OnSwitcherPaint();
 		case WM_TIMER:
 			if (wparam == DOCK_TIMER_ID) return OnSwitcherTimer();
+			if (wparam == PREVIEW_TIMER_ID) { PreviewTick(); return 0; }
 			return DefWindowProcW(hwnd, message, wparam, lparam);
 		case WM_SLIDE_DONE:
 			return OnSlideDone((u32)wparam);
@@ -2765,6 +3325,9 @@ static LRESULT CALLBACK SwitcherWindowProcedure(HWND hwnd, UINT message, WPARAM 
 			return 1;
 		case WM_CLOSE:
 			return OnSwitcherClose();
+		case WM_DESTROY:
+			PostQuitMessage(0); // Ends the message loop in RunCmdTab
+			return 0;
 		default:
 			return DefWindowProcW(hwnd, message, wparam, lparam);
 	}
