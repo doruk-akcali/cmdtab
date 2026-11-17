@@ -9,6 +9,7 @@ A fork of [stianhoiland/cmdtab](https://github.com/stianhoiland/cmdtab) v1.7 wit
 | Accent outline, Windows 11 font | Selection outline follows the Windows accent colour live; app names in Segoe UI Variable, DPI-aware |
 | Slide on switch | The previous window slides off to the left and fades as the new one takes its place, synced to the display's refresh rate |
 | Liquid glass | The switcher's background is a blurred, tinted, lens-edged view of what's behind it |
+| Window previews | Apps with several windows glow purple. Resting on one for a moment (Tab or mouse) zooms a glass panel of live window previews out of its icon. Tab walks through those windows before moving on; Up enters the panel at once, Left/Right move in it, Down goes back; hovering a preview selects it and clicking switches to it |
 
 Upstream has since reorganised its files (`main`), so these changes stay on top of v1.7.
 
