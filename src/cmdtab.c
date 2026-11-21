@@ -339,6 +339,12 @@ static void FindClaudeAppPath(void)
 	CloseHandle(snapshot);
 }
 
+// Is this exe path the Claude desktop app (Store install)?
+static bool IsClaudeAppPath(const u16 *path)
+{
+	return StrStrIW(path, L"\\WindowsApps\\Claude_") && !_wcsicmp(PathFindFileNameW(path), L"claude.exe");
+}
+
 // Exe path used to group a window into an app; the bot window borrows the Claude app's path
 static string GetGroupingExePath(handle hwnd)
 {
@@ -1852,7 +1858,7 @@ static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 		if (IsClaudeBotWindow(app->windows[j])) { bot = true; break; }
 	}
 	bool glow = GlassBack != null && (app->windowsCount > 1 || bot);
-	COLORREF glowColor = bot ? BotGlowColor : MultiGlowColor;
+	COLORREF glowColor = (bot || IsClaudeAppPath(app->path.text)) ? BotGlowColor : MultiGlowColor; // Claude always blue
 	f32 s = DrawingDims.drawScale;
 	RECT glowRect = {appRect.left + (i32)(s * 2), appRect.top + (i32)(s * 2), appRect.right - (i32)(s * 2), appRect.bottom - (i32)(s * 2)};
 	if (isSelected || isMouseover) {
@@ -2134,8 +2140,20 @@ static void SlideCapture(handle hwnd)
 
 // Called just before 'target' is activated: put the snapshot on screen where
 // the old window is, then let the timer slide it away
+// Picking Claude goes to the Claude app's own window, never the Telegram bot console grouped
+// under it; Alt+T (KeepSelectedWindow) and Alt+` (which walks windows) are the ways to the bot
+static bool KeepSelectedWindow;
+static void ClaudeRedirect(void)
+{
+	if (KeepSelectedWindow || !SelectedApp || !SelectedWindow || !IsClaudeBotWindow(*SelectedWindow)) return;
+	for (int j = 0; j < SelectedApp->windowsCount; j++) {
+		if (!IsClaudeBotWindow(SelectedApp->windows[j])) { SelectedWindow = &SelectedApp->windows[j]; return; }
+	}
+}
+
 static void SlideBegin(handle target)
 {
+	if (SelectedWindow && target == *SelectedWindow) { ClaudeRedirect(); target = *SelectedWindow; }
 	if (!SlideBitmap || SlideAnimating) return;
 	if (GetAppHost(target) == SlideFromWindow || target == SlideFromWindow) {
 		SlideDiscard(); // Same window, nothing to uncover
@@ -2489,7 +2507,7 @@ static void PreviewTick(void)
 		} else if (PreviewDir < 0) {
 			PreviewDir = 1; // Came back while it was closing: open again from where it is
 		}
-	} else if (WantApp && WantApp->windowsCount > 1 && settled && Config.groupByApp) {
+	} else if (WantApp && WantApp->windowsCount > 1 && settled && Config.groupByApp && !IsClaudeAppPath(WantApp->path.text)) {
 		PreviewOpen(WantApp);
 	}
 	if (!PreviewApp) return;
@@ -2811,6 +2829,7 @@ static void ShowSelectedWindow(void)
 	RedrawSwitcher();
 	///*dbg*/Print(L"RedrawSwitcher %llims elapsed\n", FinishMeasuring(start));
 	ReceiveLastInputEvent();
+	ClaudeRedirect();
 	ShowWindowX(*SelectedWindow);
 }
 
@@ -2827,6 +2846,7 @@ static void HideSwitcher(void)
 	SelectedApp = null;
 	SelectedWindow = null;
 	MouseApp = null;
+	KeepSelectedWindow = false;
 }
 
 //static void CloseWindows(handle hwnd) // Alternative to TerminateWindowProcess
@@ -2909,6 +2929,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			}
 			SelectFirstApp(); // Initialize selection
 			SlideDiscard(); // A slide still running from the last switch ends here
+			KeepSelectedWindow = false;
 			if (*SelectedWindow == GetCoreWindow(GetForegroundWindow())) { // Don't select next when on blank desktop
 				if (!Config.fastSwitchingForApps) {
 					SlideCapture(GetForegroundWindow());
@@ -2938,6 +2959,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				goto passMessage;
 			}
 			SelectFirstApp(); // Initialize selection
+			KeepSelectedWindow = true; // Walking windows: the bot window is a valid stop
 			SelectNextWindow(shiftHeld, !keyRepeat || !Config.wrapbump);
 			if (Config.fastSwitchingForWindows) {
 				ShowSelectedWindow();
@@ -3006,7 +3028,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 						PreviewSetSel((int)((PreviewSel + (back ? PreviewCount - 1 : 1)) % PreviewCount));
 						handled = true;
 					}
-				} else if (upDown && SelectedApp && SelectedApp->windowsCount > 1 && Config.groupByApp && Config.showSwitcherForApps) {
+				} else if (upDown && SelectedApp && SelectedApp->windowsCount > 1 && Config.groupByApp && Config.showSwitcherForApps && !IsClaudeAppPath(SelectedApp->path.text)) {
 					PreviewOpenNow();
 					handled = true;
 				}
@@ -3072,6 +3094,24 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			bool keyHDown   = keyCode == 'H' && keyDown;
 			bool keyBUp     = keyCode == 'B' && !keyDown;
 			bool keyGDown   = keyCode == 'G' && keyDown;
+			bool keyTDown   = keyCode == 'T' && keyDown;
+
+			// Alt-T on Claude (selected, or under the mouse) - switch to the Claude Telegram bot window
+			if (keyTDown) {
+				struct app *app = MouseApp ? MouseApp : SelectedApp;
+				for (int j = 0; app && j < app->windowsCount; j++) {
+					if (IsClaudeBotWindow(app->windows[j])) {
+						SelectedApp = app;
+						SelectedWindow = &app->windows[j];
+						KeepSelectedWindow = true;
+						SlideBegin(*SelectedWindow);
+						ShowSelectedWindow();
+						HideSwitcher();
+						break;
+					}
+				}
+				goto consumeMessage;
+			}
 
 			// Alt-F4 - quit cmdtab
 			if (keyF4Down) {
