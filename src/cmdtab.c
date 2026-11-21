@@ -307,6 +307,60 @@ static string GetExePath(handle hwnd)
 	return path;
 }
 
+// Doruk's Claude Telegram bot (2026-11-21): its console window is marked with this window
+// property by TelegramWindow.exe. cmdtab lists it as one of the Claude app's windows (instead
+// of a separate console app) and gives the Claude icon a blue glow while it is open.
+static bool IsClaudeBotWindow(handle hwnd)
+{
+	return GetPropW(hwnd, L"CmdtabGroupWithClaude") != null;
+}
+
+static string ClaudeAppPath;
+
+// Finds the running Claude app's exe by process, so it also works while Claude's window is hidden in the tray
+static void FindClaudeAppPath(void)
+{
+	handle snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) return;
+	PROCESSENTRY32W entry = {.dwSize = sizeof entry};
+	for (BOOL more = Process32FirstW(snapshot, &entry); more; more = Process32NextW(snapshot, &entry)) {
+		if (_wcsicmp(entry.szExeFile, L"Claude.exe")) continue;
+		handle process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, entry.th32ProcessID);
+		if (!process) continue;
+		string p = {0};
+		ULONG length = countof(p.text);
+		if (QueryFullProcessImageNameW(process, 0, p.text, &length) && StrStrIW(p.text, L"\\WindowsApps\\Claude_")) {
+			p.length = (i16)length;
+			ClaudeAppPath = p;
+		}
+		CloseHandle(process);
+		if (ClaudeAppPath.length > 0) break;
+	}
+	CloseHandle(snapshot);
+}
+
+// Is this exe path the Claude desktop app (Store install)?
+static bool IsClaudeAppPath(const u16 *path)
+{
+	return StrStrIW(path, L"\\WindowsApps\\Claude_") && !_wcsicmp(PathFindFileNameW(path), L"claude.exe");
+}
+
+// Exe path used to group a window into an app; the bot window borrows the Claude app's path
+static string GetGroupingExePath(handle hwnd)
+{
+	string path = GetExePath(hwnd);
+	if (path.length > 0 && IsClaudeBotWindow(hwnd)) {
+		// Looked up afresh each time (once per Alt+Tab): Claude updates itself into a new
+		// versioned folder, and the old folder can linger, so a cached path goes stale
+		string previous = ClaudeAppPath;
+		ClaudeAppPath.length = 0;
+		FindClaudeAppPath();
+		if (ClaudeAppPath.length <= 0) ClaudeAppPath = previous; // Claude not running: keep the last known path
+		if (ClaudeAppPath.length > 0) return ClaudeAppPath;
+	}
+	return path;
+}
+
 static string GetWindowTitle(handle hwnd)
 {
 	string title = {0};
@@ -1016,6 +1070,7 @@ static i32  GlassBackW, GlassBackH;
 static LRESULT CALLBACK PreviewWindowProcedure(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 static handle Preview;              // Window-preview panel above the switcher (see "Window previews")
 static const COLORREF MultiGlowColor = RGB(170, 105, 255); // Glow around apps with several windows
+static const COLORREF BotGlowColor = RGB(56, 152, 255); // Blue halo on Claude while its Telegram bot window is open
 
 static void GlassBoxBlur(u32 *src, u32 *dst, i32 w, i32 h, i32 r, bool vertical) // One box pass, clamped edges
 {
@@ -1413,7 +1468,7 @@ static void AddToApps(handle hwnd)
 		return;
 	}
 	// 3. Get module filepath, abort if failed (most likely access denied)
-	string filepath = GetExePath(hwnd);
+	string filepath = GetGroupingExePath(hwnd);
 	if (filepath.length <= 0) {
 		return; // Don't have to print error, since GetExePath already does that
 	}
@@ -1799,7 +1854,15 @@ static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 
 	RECT selRect = {appRect.left - SEL_VERT_OFF, appRect.top - SEL_HORZ_OFF, appRect.right + SEL_VERT_OFF, appRect.bottom + SEL_HORZ_OFF};
 	// Several windows: a purple glow around the icon (on the glass, under the icon)
-	bool glow = GlassBack != null && app->windowsCount > 1;
+	// The Claude Telegram bot window turns the glow blue (a halo on the Claude icon)
+	bool bot = false;
+	for (int j = 0; j < app->windowsCount; j++) {
+		if (IsClaudeBotWindow(app->windows[j])) { bot = true; break; }
+	}
+	bool claude = bot || IsClaudeAppPath(app->path.text); // Claude always has a blue halo, a bit stronger than the purple one
+	bool glow = GlassBack != null && (app->windowsCount > 1 || claude);
+	COLORREF glowColor = claude ? BotGlowColor : MultiGlowColor;
+	f32 glowBoost = claude ? 1.4f : 1.0f;
 	f32 s = DrawingDims.drawScale;
 	RECT glowRect = {appRect.left + (i32)(s * 2), appRect.top + (i32)(s * 2), appRect.right - (i32)(s * 2), appRect.bottom - (i32)(s * 2)};
 	if (isSelected || isMouseover) {
@@ -1809,12 +1872,12 @@ static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 			GlassDarken(selRect, SEL_RADIUS, 0.45f);
 			SelectObject(DrawingContext, GetStockObject(NULL_BRUSH));
 		}
-		if (glow) GlassGlow(glowRect, (i32)(width * 0.22f), (i32)(s * 9), MultiGlowColor, 0.85f);
+		if (glow) GlassGlow(glowRect, (i32)(width * 0.22f), (i32)(s * 9 * glowBoost), glowColor, claude ? 1.0f : 0.85f);
 		RoundRect(DrawingContext, selRect.left, selRect.top, selRect.right, selRect.bottom, SEL_RADIUS, SEL_RADIUS);
 		DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, glass ? null : backgroundBrush, DI_NORMAL);
 	} else {
 		// Draw icon straight onto the background (the glass shows around its edges)
-		if (glow) GlassGlow(glowRect, (i32)(width * 0.22f), (i32)(s * 8), MultiGlowColor, 0.7f);
+		if (glow) GlassGlow(glowRect, (i32)(width * 0.22f), (i32)(s * 8 * glowBoost), glowColor, claude ? 1.0f : 0.7f);
 		DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, GlassBack ? null : backgroundBrush, DI_NORMAL);
 	}
 
@@ -2081,8 +2144,20 @@ static void SlideCapture(handle hwnd)
 
 // Called just before 'target' is activated: put the snapshot on screen where
 // the old window is, then let the timer slide it away
+// Picking Claude goes to the Claude app's own window, never the Telegram bot console grouped
+// under it; Alt+T (KeepSelectedWindow) and Alt+` (which walks windows) are the ways to the bot
+static bool KeepSelectedWindow;
+static void ClaudeRedirect(void)
+{
+	if (KeepSelectedWindow || !SelectedApp || !SelectedWindow || !IsClaudeBotWindow(*SelectedWindow)) return;
+	for (int j = 0; j < SelectedApp->windowsCount; j++) {
+		if (!IsClaudeBotWindow(SelectedApp->windows[j])) { SelectedWindow = &SelectedApp->windows[j]; return; }
+	}
+}
+
 static void SlideBegin(handle target)
 {
+	if (SelectedWindow && target == *SelectedWindow) { ClaudeRedirect(); target = *SelectedWindow; }
 	if (!SlideBitmap || SlideAnimating) return;
 	if (GetAppHost(target) == SlideFromWindow || target == SlideFromWindow) {
 		SlideDiscard(); // Same window, nothing to uncover
@@ -2436,7 +2511,7 @@ static void PreviewTick(void)
 		} else if (PreviewDir < 0) {
 			PreviewDir = 1; // Came back while it was closing: open again from where it is
 		}
-	} else if (WantApp && WantApp->windowsCount > 1 && settled && Config.groupByApp) {
+	} else if (WantApp && WantApp->windowsCount > 1 && settled && Config.groupByApp && !IsClaudeAppPath(WantApp->path.text)) {
 		PreviewOpen(WantApp);
 	}
 	if (!PreviewApp) return;
@@ -2758,6 +2833,7 @@ static void ShowSelectedWindow(void)
 	RedrawSwitcher();
 	///*dbg*/Print(L"RedrawSwitcher %llims elapsed\n", FinishMeasuring(start));
 	ReceiveLastInputEvent();
+	ClaudeRedirect();
 	ShowWindowX(*SelectedWindow);
 }
 
@@ -2774,6 +2850,7 @@ static void HideSwitcher(void)
 	SelectedApp = null;
 	SelectedWindow = null;
 	MouseApp = null;
+	KeepSelectedWindow = false;
 }
 
 //static void CloseWindows(handle hwnd) // Alternative to TerminateWindowProcess
@@ -2856,6 +2933,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			}
 			SelectFirstApp(); // Initialize selection
 			SlideDiscard(); // A slide still running from the last switch ends here
+			KeepSelectedWindow = false;
 			if (*SelectedWindow == GetCoreWindow(GetForegroundWindow())) { // Don't select next when on blank desktop
 				if (!Config.fastSwitchingForApps) {
 					SlideCapture(GetForegroundWindow());
@@ -2885,6 +2963,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				goto passMessage;
 			}
 			SelectFirstApp(); // Initialize selection
+			KeepSelectedWindow = true; // Walking windows: the bot window is a valid stop
 			SelectNextWindow(shiftHeld, !keyRepeat || !Config.wrapbump);
 			if (Config.fastSwitchingForWindows) {
 				ShowSelectedWindow();
@@ -2953,7 +3032,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 						PreviewSetSel((int)((PreviewSel + (back ? PreviewCount - 1 : 1)) % PreviewCount));
 						handled = true;
 					}
-				} else if (upDown && SelectedApp && SelectedApp->windowsCount > 1 && Config.groupByApp && Config.showSwitcherForApps) {
+				} else if (upDown && SelectedApp && SelectedApp->windowsCount > 1 && Config.groupByApp && Config.showSwitcherForApps && !IsClaudeAppPath(SelectedApp->path.text)) {
 					PreviewOpenNow();
 					handled = true;
 				}
@@ -3019,6 +3098,24 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			bool keyHDown   = keyCode == 'H' && keyDown;
 			bool keyBUp     = keyCode == 'B' && !keyDown;
 			bool keyGDown   = keyCode == 'G' && keyDown;
+			bool keyTDown   = keyCode == 'T' && keyDown;
+
+			// Alt-T on Claude (selected, or under the mouse) - switch to the Claude Telegram bot window
+			if (keyTDown) {
+				struct app *app = MouseApp ? MouseApp : SelectedApp;
+				for (int j = 0; app && j < app->windowsCount; j++) {
+					if (IsClaudeBotWindow(app->windows[j])) {
+						SelectedApp = app;
+						SelectedWindow = &app->windows[j];
+						KeepSelectedWindow = true;
+						SlideBegin(*SelectedWindow);
+						ShowSelectedWindow();
+						HideSwitcher();
+						break;
+					}
+				}
+				goto consumeMessage;
+			}
 
 			// Alt-F4 - quit cmdtab
 			if (keyF4Down) {
@@ -3031,9 +3128,15 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				int index = (int)(SelectedApp - Apps);
 				string path = SelectedApp->path;
 				f32 scale = DockScale(index);
+				// Quit the Claude app itself, not the Telegram bot console grouped under it
+				handle target = *SelectedWindow;
+				for (int j = 0; IsClaudeBotWindow(target) && j < SelectedApp->windowsCount; j++) {
+					target = SelectedApp->windows[j];
+				}
+				if (IsClaudeBotWindow(target)) target = *SelectedWindow; // Only the bot is listed
 				ULONG pid = 0;
-				GetWindowThreadProcessId(*SelectedWindow, &pid);
-				if (!TerminateWindowProcess(*SelectedWindow)) {
+				GetWindowThreadProcessId(target, &pid);
+				if (!TerminateWindowProcess(target)) {
 					goto consumeMessage; // e.g. access denied: leave the switcher as it is
 				}
 				handle icon = CopyIcon(SelectedApp->icon); // Before UpdateApps may reuse the slot
