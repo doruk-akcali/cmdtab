@@ -350,10 +350,12 @@ static string GetGroupingExePath(handle hwnd)
 {
 	string path = GetExePath(hwnd);
 	if (path.length > 0 && IsClaudeBotWindow(hwnd)) {
-		if (ClaudeAppPath.length <= 0 || GetFileAttributesW(ClaudeAppPath.text) == INVALID_FILE_ATTRIBUTES) {
-			ClaudeAppPath.length = 0;
-			FindClaudeAppPath();
-		}
+		// Looked up afresh each time (once per Alt+Tab): Claude updates itself into a new
+		// versioned folder, and the old folder can linger, so a cached path goes stale
+		string previous = ClaudeAppPath;
+		ClaudeAppPath.length = 0;
+		FindClaudeAppPath();
+		if (ClaudeAppPath.length <= 0) ClaudeAppPath = previous; // Claude not running: keep the last known path
 		if (ClaudeAppPath.length > 0) return ClaudeAppPath;
 	}
 	return path;
@@ -1857,8 +1859,10 @@ static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 	for (int j = 0; j < app->windowsCount; j++) {
 		if (IsClaudeBotWindow(app->windows[j])) { bot = true; break; }
 	}
-	bool glow = GlassBack != null && (app->windowsCount > 1 || bot);
-	COLORREF glowColor = (bot || IsClaudeAppPath(app->path.text)) ? BotGlowColor : MultiGlowColor; // Claude always blue
+	bool claude = bot || IsClaudeAppPath(app->path.text); // Claude always has a blue halo, a bit stronger than the purple one
+	bool glow = GlassBack != null && (app->windowsCount > 1 || claude);
+	COLORREF glowColor = claude ? BotGlowColor : MultiGlowColor;
+	f32 glowBoost = claude ? 1.4f : 1.0f;
 	f32 s = DrawingDims.drawScale;
 	RECT glowRect = {appRect.left + (i32)(s * 2), appRect.top + (i32)(s * 2), appRect.right - (i32)(s * 2), appRect.bottom - (i32)(s * 2)};
 	if (isSelected || isMouseover) {
@@ -1868,12 +1872,12 @@ static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 			GlassDarken(selRect, SEL_RADIUS, 0.45f);
 			SelectObject(DrawingContext, GetStockObject(NULL_BRUSH));
 		}
-		if (glow) GlassGlow(glowRect, (i32)(width * 0.22f), (i32)(s * 9), glowColor, 0.85f);
+		if (glow) GlassGlow(glowRect, (i32)(width * 0.22f), (i32)(s * 9 * glowBoost), glowColor, claude ? 1.0f : 0.85f);
 		RoundRect(DrawingContext, selRect.left, selRect.top, selRect.right, selRect.bottom, SEL_RADIUS, SEL_RADIUS);
 		DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, glass ? null : backgroundBrush, DI_NORMAL);
 	} else {
 		// Draw icon straight onto the background (the glass shows around its edges)
-		if (glow) GlassGlow(glowRect, (i32)(width * 0.22f), (i32)(s * 8), glowColor, 0.7f);
+		if (glow) GlassGlow(glowRect, (i32)(width * 0.22f), (i32)(s * 8 * glowBoost), glowColor, claude ? 1.0f : 0.7f);
 		DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, GlassBack ? null : backgroundBrush, DI_NORMAL);
 	}
 
