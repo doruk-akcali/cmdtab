@@ -884,7 +884,16 @@ struct app {
 	handle icon;                // Big app icon
 	handle windows[64];         // App windows that can be switched to
 	iz windowsCount;            // Number of elements in 'windows' array
+	iz groupCount;              // > 0: a snap group, see "Snap groups"; windows[] are its snapped windows, most recent first
+	handle groupIcons[4];       // Icons of the group's apps (copies, destroyed on slot reuse)
+	string groupPaths[4];       // Exe paths of the group's apps (for the smooth-icon cache)
 };
+
+static void FreeGroupIcons(struct app *a)
+{
+	for (iz k = 0; k < a->groupCount && k < 4; k++) if (a->groupIcons[k]) DestroyIcon(a->groupIcons[k]);
+	a->groupCount = 0;
+}
 
 struct gui {
 	f32 drawScale; // DPI scale of the monitor where the cursor is, which is where the switcher will be displayed
@@ -1500,6 +1509,7 @@ static void AddToApps(handle hwnd)
 		// (except title ofc)
 		struct app *window = &Apps[AppsCount++];
 		if (window->icon) DestroyIcon(window->icon);
+		FreeGroupIcons(window);
 		window->path = app->path;
 		window->title = GetWindowTitle(hwnd);
 		window->icon = app->icon; // TODO Does this lead to double free app->icon?
@@ -1517,6 +1527,7 @@ static void AddToApps(handle hwnd)
 		// Since I reset by truncating (setting AppsCount to 0), make sure to overwrite all struct fields when reusing array slots
 		app = &Apps[AppsCount++];
 		if (app->icon) DestroyIcon(app->icon); // In fact, I have to do a little lazy cleanup
+		FreeGroupIcons(app);
 		app->path = filepath;
 		app->title = title;
 		app->icon = packaged ? CopyIcon(packaged->icon) : GetAppIcon(&filepath); // Copy, since app icons are destroyed on reuse
@@ -1596,6 +1607,135 @@ static void RemoveProcessWindows(ULONG pid)
 	}
 }
 
+// ========================================
+// Snap groups (Doruk, 2026-11-24)
+// ========================================
+// Like the taskbar's snap groups: windows snapped side by side (Snap Layouts) that together fill
+// a monitor get an extra entry, drawn as their apps' icons close together, which brings them
+// all back at once. Windows doesn't expose its own snap groups, so a group is: two to four
+// arranged (snapped) windows on one monitor, not overlapping, covering at least 85% of its work
+// area, picked in order of recent use.
+
+#define GROUP_MAX 4
+#define GROUP_GAP 0.1f // Gap between a group's icons, in icon widths (other icons sit ~0.75 apart)
+
+static f32 AppUnits(struct app *a) // Width of an entry, in icon widths
+{
+	return a->groupCount ? a->groupCount + (a->groupCount - 1) * GROUP_GAP : 1;
+}
+
+static i64 RectArea(RECT r)
+{
+	return r.right > r.left && r.bottom > r.top ? (i64)(r.right - r.left) * (r.bottom - r.top) : 0;
+}
+
+typedef BOOL (WINAPI *IsWindowArrangedFn)(HWND);
+
+static void AddSnapGroups(void)
+{
+	static IsWindowArrangedFn isArranged;
+	static bool looked;
+	if (!looked) {
+		looked = true;
+		isArranged = (IsWindowArrangedFn)(void *)GetProcAddress(GetModuleHandleW(L"user32.dll"), "IsWindowArranged"); // Windows 10 2004+
+	}
+	if (!isArranged) return;
+
+	struct cand { handle hwnd; int app; HMONITOR mon; RECT r; bool used; };
+	static struct cand c[64];
+	int n = 0;
+	for (int i = 0; i < AppsCount && n < 64; i++) {
+		for (iz j = 0; j < Apps[i].windowsCount && n < 64; j++) {
+			handle w = Apps[i].windows[j];
+			handle host = GetAppHost(w);
+			if (IsIconic(host) || !isArranged(host)) continue;
+			RECT r = {0};
+			if (FAILED(DwmGetWindowAttribute(host, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof r))) GetWindowRect(host, &r);
+			c[n++] = (struct cand){w, i, MonitorFromWindow(host, MONITOR_DEFAULTTONEAREST), r, false};
+		}
+	}
+
+	struct spec { int pos, count; handle windows[GROUP_MAX]; handle icons[GROUP_MAX]; string paths[GROUP_MAX]; string title; };
+	static struct spec specs[8];
+	int specCount = 0;
+	handle fg = GetCoreWindow(GetForegroundWindow());
+	for (int s = 0; s < n && specCount < 8; s++) {
+		if (c[s].used) continue;
+		MONITORINFO mi = {.cbSize = sizeof mi};
+		if (!GetMonitorInfoW(c[s].mon, &mi)) continue;
+		i64 work = RectArea(mi.rcWork);
+		if (!work) continue;
+		int members[GROUP_MAX], count = 0;
+		i64 covered = 0;
+		for (int k = s; k < n && count < GROUP_MAX; k++) {
+			if (c[k].used || c[k].mon != c[s].mon) continue;
+			RECT in;
+			IntersectRect(&in, &c[k].r, &mi.rcWork);
+			i64 a = RectArea(in);
+			if (a < work / 20) continue;
+			bool overlaps = false;
+			for (int m = 0; m < count && !overlaps; m++) {
+				RECT o;
+				IntersectRect(&o, &c[k].r, &c[members[m]].r);
+				overlaps = RectArea(o) * 10 > a;
+			}
+			if (overlaps) continue;
+			members[count++] = k;
+			covered += a;
+		}
+		if (count < 2 || covered * 100 < work * 85) continue;
+		struct spec *g = &specs[specCount++];
+		*g = (struct spec){0};
+		int minApp = 1 << 30, maxApp = -1;
+		bool active = false;
+		for (int m = 0; m < count; m++) {
+			struct cand *k = &c[members[m]];
+			k->used = true;
+			g->windows[m] = k->hwnd;
+			g->icons[m] = Apps[k->app].icon;
+			g->paths[m] = Apps[k->app].path;
+			if (k->app < minApp) minApp = k->app;
+			if (k->app > maxApp) maxApp = k->app;
+			if (k->hwnd == fg) active = true;
+			i32 len = g->title.length > 0 ? g->title.length : 0;
+			i32 wrote = swprintf(g->title.text + len, countof(g->title.text) - len, m ? L" + %ls" : L"%ls", Apps[k->app].title.text);
+			if (wrote > 0) g->title.length = (i16)(len + wrote);
+		}
+		g->count = count;
+		// In use right now: after its apps (Alt+Tab goes elsewhere first). Otherwise: just before its most recent app
+		g->pos = active ? maxApp + 1 : (minApp < 1 ? 1 : minApp);
+	}
+
+	// Insert from the back, so earlier positions stay valid
+	for (int a = 0; a < specCount; a++) {
+		int best = a;
+		for (int b = a + 1; b < specCount; b++) if (specs[b].pos > specs[best].pos) best = b;
+		struct spec t = specs[a]; specs[a] = specs[best]; specs[best] = t;
+	}
+	for (int a = 0; a < specCount && AppsCount < countof(Apps); a++) {
+		struct spec *g = &specs[a];
+		int pos = g->pos > AppsCount ? AppsCount : g->pos;
+		struct app *spare = &Apps[AppsCount]; // Stale slot about to be overwritten by the shift
+		if (spare->icon) DestroyIcon(spare->icon);
+		spare->icon = null;
+		FreeGroupIcons(spare);
+		memmove(&Apps[pos + 1], &Apps[pos], sizeof Apps[0] * (AppsCount - pos));
+		AppsCount++;
+		struct app *e = &Apps[pos]; // Still a shallow copy of its neighbour: overwrite, don't free
+		e->path = (string){.text = L"", .length = 0};
+		e->title = g->title;
+		e->icon = null;
+		e->windowsCount = g->count;
+		e->groupCount = g->count;
+		for (int m = 0; m < g->count; m++) {
+			e->windows[m] = g->windows[m];
+			e->groupIcons[m] = CopyIcon(g->icons[m]);
+			e->groupPaths[m] = g->paths[m];
+		}
+		Log(L"snap group of %i windows at %i\n", g->count, pos);
+	}
+}
+
 static void UpdateApps(void)
 {
 	// Rebuild the whole window list and measure how long it takes
@@ -1618,6 +1758,7 @@ static void UpdateApps(void)
 	if (DyingPid && (i32)(DyingUntil - timeGetTime()) > 0) {
 		RemoveProcessWindows(DyingPid);
 	}
+	if (Config.groupByApp) AddSnapGroups();
 	Print(L"UpdateApps (%i windows) %llims elapsed\n", windowsCount, FinishMeasuring(start));
 	PrintApps();
 }
@@ -1755,7 +1896,12 @@ static void ResizeSwitcher(void)
 	GetCursorPos(&mousePos);
 	GetMonitorInfoW(MonitorFromPoint(mousePos, MONITOR_DEFAULTTONEAREST), &mi);
 
-	u32   iconsWidth = AppsCount * iconSize;
+	f32 units = 0, maxUnits = 1;
+	for (int i = 0; i < AppsCount; i++) {
+		units += AppUnits(&Apps[i]);
+		if (AppUnits(&Apps[i]) > maxUnits) maxUnits = AppUnits(&Apps[i]);
+	}
+	u32   iconsWidth = (u32)(units * iconSize + 0.5f);
 	u32 paddingWidth = AppsCount * iconHorzMargin * 2;
 	u32  marginWidth =         2 * switcherHorzMargin;
 	u32     iconRows = 1;
@@ -1764,7 +1910,7 @@ static void ResizeSwitcher(void)
 
 	// Room for the magnification: at most about DockRange icons' worth of
 	// extra width across the bulge, and the focused icon's extra height
-	u32 dockWidth  = (DockMaxScale - 1) * iconSize * (DockRange + 0.5f);
+	u32 dockWidth  = (DockMaxScale - 1) * iconSize * (DockRange + 0.5f) * maxUnits;
 	u32 dockHeight = (DockMaxScale - 1) * iconSize;
 
 	u32 w = iconsWidth + paddingWidth + marginWidth + dockWidth;
@@ -1993,6 +2139,23 @@ static bool DrawIconSmooth(string *path, HICON icon, i32 left, i32 top, i32 size
 	return true;
 }
 
+// Draws an entry's icon, or a snap group's icons side by side, close together
+static void DrawAppIcon(struct app *app, RECT r, HBRUSH bg)
+{
+	i32 size = r.bottom - r.top;
+	if (app->groupCount) {
+		f32 step = size * (1 + GROUP_GAP);
+		for (iz k = 0; k < app->groupCount; k++) {
+			i32 x = r.left + (i32)(k * step + 0.5f);
+			if (!DrawIconSmooth(&app->groupPaths[k], app->groupIcons[k], x, r.top, size))
+				DrawIconEx(DrawingContext, x, r.top, app->groupIcons[k], size, size, 0, bg, DI_NORMAL);
+		}
+		return;
+	}
+	if (r.right - r.left != size || !DrawIconSmooth(&app->path, app->icon, r.left, r.top, size))
+		DrawIconEx(DrawingContext, r.left, r.top, app->icon, r.right - r.left, size, 0, bg, DI_NORMAL);
+}
+
 static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 {
 	u32 ICON_WIDTH = DrawingDims.iconSize;
@@ -2042,7 +2205,7 @@ static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 		if (IsClaudeBotWindow(app->windows[j])) { bot = true; break; }
 	}
 	bool claude = bot || IsClaudeAppPath(app->path.text); // Claude always has a blue halo, a bit stronger than the purple one
-	bool glow = GlassBack != null && (app->windowsCount > 1 || claude);
+	bool glow = GlassBack != null && !app->groupCount && (app->windowsCount > 1 || claude);
 	COLORREF glowColor = claude ? BotGlowColor : MultiGlowColor;
 	f32 glowBoost = claude ? 1.4f : 1.0f;
 	f32 s = DrawingDims.drawScale;
@@ -2056,19 +2219,22 @@ static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 		}
 		if (glow) GlassGlow(glowRect, (i32)(width * 0.22f), (i32)(s * 9 * glowBoost), glowColor, claude ? 1.0f : 0.85f);
 		RoundRect(DrawingContext, selRect.left, selRect.top, selRect.right, selRect.bottom, SEL_RADIUS, SEL_RADIUS);
-		if (width != height || !DrawIconSmooth(&app->path, app->icon, appRect.left, appRect.top, width))
-			DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, glass ? null : backgroundBrush, DI_NORMAL);
+		DrawAppIcon(app, appRect, glass ? null : backgroundBrush);
 	} else {
 		// Draw icon straight onto the background (the glass shows around its edges)
 		if (glow) GlassGlow(glowRect, (i32)(width * 0.22f), (i32)(s * 8 * glowBoost), glowColor, claude ? 1.0f : 0.7f);
-		if (width != height || !DrawIconSmooth(&app->path, app->icon, appRect.left, appRect.top, width))
-			DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, GlassBack ? null : backgroundBrush, DI_NORMAL);
+		if (app->groupCount && GlassBack) { // A faint shared pane makes the group's icons read as one
+			i32 pad = (i32)(height * 0.1f);
+			RECT pane = {appRect.left - pad, appRect.top - pad, appRect.right + pad, appRect.bottom + pad};
+			GlassDarken(pane, (i32)(height * 0.3f), 0.22f);
+		}
+		DrawAppIcon(app, appRect, GlassBack ? null : backgroundBrush);
 	}
 
 	if ((isSelected && !hasMouseover) || isMouseover) {
 		// Add window count to app name
 		string title = {0};
-		if (app->windowsCount > 1) {
+		if (app->windowsCount > 1 && !app->groupCount) {
 			title.length = swprintf(title.text, countof(title.text), L"%ls (%u)", app->title.text, app->windowsCount);
 		} else {
 			title.length = swprintf(title.text, countof(title.text), L"%ls", app->title.text);
@@ -2156,7 +2322,7 @@ static void DockLayout(void)
 
 	f32 rowWidth = gap;
 	for (int i = 0; i < AppsCount; i++) {
-		rowWidth += ICON_PAD + ICON_WIDTH * DockScale(i) + ICON_PAD;
+		rowWidth += ICON_PAD + ICON_WIDTH * DockScale(i) * AppUnits(&Apps[i]) + ICON_PAD;
 	}
 
 	i32 baseline = VERT_PAD + (i32)(ICON_WIDTH * DockMaxScale);
@@ -2173,11 +2339,12 @@ static void DockLayout(void)
 		}
 		if (i == AppsCount) break;
 		i32 size = (i32)(ICON_WIDTH * DockScale(i) + 0.5f);
+		i32 span = (i32)(size * AppUnits(&Apps[i]) + 0.5f); // A snap group is several icons wide
 		DockRects[i].left   = (i32)(x + ICON_PAD + 0.5f);
-		DockRects[i].right  = DockRects[i].left + size;
+		DockRects[i].right  = DockRects[i].left + span;
 		DockRects[i].bottom = baseline;
 		DockRects[i].top    = baseline - size;
-		x += ICON_PAD + size + ICON_PAD;
+		x += ICON_PAD + span + ICON_PAD;
 	}
 }
 
@@ -2333,7 +2500,7 @@ static void SlideCapture(handle hwnd)
 static bool KeepSelectedWindow;
 static void ClaudeRedirect(void)
 {
-	if (KeepSelectedWindow || !SelectedApp || !SelectedWindow || !IsClaudeBotWindow(*SelectedWindow)) return;
+	if (KeepSelectedWindow || !SelectedApp || SelectedApp->groupCount || !SelectedWindow || !IsClaudeBotWindow(*SelectedWindow)) return;
 	for (int j = 0; j < SelectedApp->windowsCount; j++) {
 		if (!IsClaudeBotWindow(SelectedApp->windows[j])) { SelectedWindow = &SelectedApp->windows[j]; return; }
 	}
@@ -2695,7 +2862,7 @@ static void PreviewTick(void)
 		} else if (PreviewDir < 0) {
 			PreviewDir = 1; // Came back while it was closing: open again from where it is
 		}
-	} else if (WantApp && WantApp->windowsCount > 1 && settled && Config.groupByApp && !IsClaudeAppPath(WantApp->path.text)) {
+	} else if (WantApp && WantApp->windowsCount > 1 && !WantApp->groupCount && settled && Config.groupByApp && !IsClaudeAppPath(WantApp->path.text)) {
 		PreviewOpen(WantApp);
 	}
 	if (!PreviewApp) return;
@@ -3018,6 +3185,15 @@ static void ShowSelectedWindow(void)
 	///*dbg*/Print(L"RedrawSwitcher %llims elapsed\n", FinishMeasuring(start));
 	ReceiveLastInputEvent();
 	ClaudeRedirect();
+	if (SelectedApp && SelectedApp->groupCount && !KeepSelectedWindow) {
+		// Snap group: bring the other snapped windows up first, then the chosen one on top
+		for (iz k = SelectedApp->windowsCount - 1; k >= 0; k--) {
+			handle w = SelectedApp->windows[k];
+			if (w == *SelectedWindow) continue;
+			if (IsIconic(w)) ShowWindow(w, SW_RESTORE);
+			SetForegroundWindow(GetLastActivePopup(GetAppHost(w)));
+		}
+	}
 	ShowWindowX(*SelectedWindow);
 }
 
@@ -3216,7 +3392,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 						PreviewSetSel((int)((PreviewSel + (back ? PreviewCount - 1 : 1)) % PreviewCount));
 						handled = true;
 					}
-				} else if (upDown && SelectedApp && SelectedApp->windowsCount > 1 && Config.groupByApp && Config.showSwitcherForApps && !IsClaudeAppPath(SelectedApp->path.text)) {
+				} else if (upDown && SelectedApp && SelectedApp->windowsCount > 1 && Config.groupByApp && Config.showSwitcherForApps && !SelectedApp->groupCount && !IsClaudeAppPath(SelectedApp->path.text)) {
 					PreviewOpenNow();
 					handled = true;
 				}
@@ -3304,6 +3480,10 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			// Alt-F4 - quit cmdtab
 			if (keyF4Down) {
 				CloseWindowX(Switcher);
+				goto consumeMessage;
+			}
+			// Quit/close/minimize/hide don't apply to a snap group entry (it is several apps)
+			if (SelectedApp && SelectedApp->groupCount && (keyQDown || keyWDown || deleteDown || keyMDown || keyHDown)) {
 				goto consumeMessage;
 			}
 			// Alt-Q - close all windows of selected application
