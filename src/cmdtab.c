@@ -952,6 +952,8 @@ static u32         DockPopStart;    // timeGetTime() when the pop-in began
 static handle      SlideOverlay;    // Layered, click-through window that shows the snapshot while it slides
 static handle      SlideFromWindow; // Window that was in front when Alt-Tab began
 static RECT        SlideRect;       // Its on-screen bounds
+static RECT        SlideMonitor;    // Bounds of the monitor it is on: the slide never leaves it
+static HMONITOR    SlideMonitorHandle;
 static HDC         SlideContext;    // Snapshot of SlideRect
 static HBITMAP     SlideBitmap;
 static HGDIOBJ     SlideOldBitmap;
@@ -2430,10 +2432,16 @@ static DWORD WINAPI SlideThreadProcedure(LPVOID param)
 	while (!SlideCancel) {
 		f32 t = (timeGetTime() - SlideStart) / (f32)SLIDE_MS;
 		if (t >= 1) break;
-		POINT pos = {SlideRect.left - (i32)(w * SlideEase(t)), SlideRect.top};
+		i32 left = SlideRect.left - (i32)(w * SlideEase(t));
 		f32 fade = (1 - t) / 0.6f; // Fully opaque for the first 40%, then fades out
 		BLENDFUNCTION blend = {AC_SRC_OVER, 0, (BYTE)(255 * (fade > 1 ? 1 : fade)), 0};
-		UpdateLayeredWindow(SlideOverlay, null, &pos, null, null, null, 0, &blend, ULW_ALPHA); // Moves and fades without re-sending the bitmap
+		// Clip at the monitor's left edge, so the snapshot never slides onto the screen next to it
+		i32 cut = SlideMonitor.left - left;
+		if (cut < 0) cut = 0;
+		if (cut >= w) break;
+		POINT pos = {left + cut, SlideRect.top}, src = {cut, 0};
+		SIZE size = {w - cut, SlideRect.bottom - SlideRect.top};
+		UpdateLayeredWindow(SlideOverlay, null, &pos, &size, SlideContext, &src, 0, &blend, ULW_ALPHA);
 		DwmFlush();
 	}
 	PostMessageW(Switcher, WM_SLIDE_DONE, generation, 0);
@@ -2478,8 +2486,11 @@ static void SlideCapture(handle hwnd)
 		GetWindowRect(hwnd, &r);
 	}
 	MONITORINFO mi = {.cbSize = sizeof mi};
-	GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+	HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+	GetMonitorInfoW(monitor, &mi);
 	if (!IntersectRect(&r, &r, &mi.rcMonitor)) return;
+	SlideMonitor = mi.rcMonitor;
+	SlideMonitorHandle = monitor;
 
 	i32 w = r.right - r.left, h = r.bottom - r.top;
 	HDC screen = GetDC(null);
@@ -2512,6 +2523,21 @@ static void SlideBegin(handle target)
 	if (!SlideBitmap || SlideAnimating) return;
 	if (GetAppHost(target) == SlideFromWindow || target == SlideFromWindow) {
 		SlideDiscard(); // Same window, nothing to uncover
+		return;
+	}
+	// Only slide on the screen where the new window opens: if it opens on another monitor, the old
+	// window isn't being covered, so there is nothing to uncover (Doruk, 2026-11-24)
+	handle host = GetAppHost(target);
+	HMONITOR targetMonitor;
+	if (IsIconic(host)) {
+		WINDOWPLACEMENT wp = {.length = sizeof wp};
+		GetWindowPlacement(host, &wp);
+		targetMonitor = MonitorFromRect(&wp.rcNormalPosition, MONITOR_DEFAULTTONEAREST);
+	} else {
+		targetMonitor = MonitorFromWindow(host, MONITOR_DEFAULTTONEAREST);
+	}
+	if (targetMonitor != SlideMonitorHandle) {
+		SlideDiscard();
 		return;
 	}
 
