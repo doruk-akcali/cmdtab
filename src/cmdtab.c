@@ -3605,6 +3605,30 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				RedrawSwitcher();
 				goto consumeMessage;
 			}
+			// Alt-Q with a window highlighted in the window-preview panel - close just that window,
+			// not the whole app (Doruk, 2026-11-24); the panel then reopens with the windows left
+			if (keyQDown && PreviewApp && PreviewApp == SelectedApp && PreviewDir >= 0 && PreviewSel >= 0 && SelectedWindow) {
+				string path = SelectedApp->path;
+				CloseWindowX(*SelectedWindow); // Asks politely, like the window's X button
+				ClosingWindows[0] = *SelectedWindow;
+				ClosingCount = 1;
+				DyingCount = 0;
+				DyingUntil = timeGetTime() + 1000;
+				PreviewReset();
+				UpdateApps();
+				if (AppsCount == 0) {
+					HideSwitcher();
+					goto consumeMessage;
+				}
+				SelectedApp = &Apps[0];
+				for (int i = 0; i < AppsCount; i++) {
+					if (!Apps[i].groupCount && StringsAreEqual(&Apps[i].path, &path)) { SelectedApp = &Apps[i]; break; }
+				}
+				SelectedWindow = &SelectedApp->windows[0];
+				ResizeSwitcher(); // The list can change (e.g. a snap group losing a window)
+				RedrawSwitcher();
+				goto consumeMessage;
+			}
 			// Close/minimize/hide don't apply to a snap group entry (it is several apps)
 			if (SelectedApp && SelectedApp->groupCount && (keyWDown || deleteDown || keyMDown || keyHDown)) {
 				goto consumeMessage;
