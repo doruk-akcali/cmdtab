@@ -1589,6 +1589,32 @@ static BOOL CALLBACK _AddToApps(HWND hwnd, LPARAM lparam)
 	return true; // Return true to continue EnumWindows
 }
 
+// Windows just asked to close by Alt-Q on a snap group: left out of the list until DyingUntil,
+// even if they take a moment to close (one that refuses, e.g. to ask about saving, comes back)
+static handle ClosingWindows[4];
+static int    ClosingCount;
+
+static void RemoveClosingWindows(void)
+{
+	for (int i = 0; i < AppsCount; i++) {
+		struct app *app = &Apps[i];
+		iz kept = 0;
+		for (iz j = 0; j < app->windowsCount; j++) {
+			bool closing = false;
+			for (int c = 0; c < ClosingCount; c++) closing |= ClosingWindows[c] == app->windows[j];
+			if (!closing) app->windows[kept++] = app->windows[j];
+		}
+		app->windowsCount = kept;
+		if (kept == 0) {
+			struct app removed = *app;
+			memmove(&Apps[i], &Apps[i+1], (AppsCount - i - 1) * sizeof *app);
+			Apps[AppsCount-1] = removed;
+			AppsCount--;
+			i--;
+		}
+	}
+}
+
 // Drops the windows of 'pid' from 'Apps'; an app left without windows moves
 // past the end of the list (swapped, not overwritten, so its icon handle
 // stays owned by exactly one slot)
@@ -1787,6 +1813,9 @@ static void UpdateApps(void)
 	}
 	for (int d = 0; d < DyingCount && (i32)(DyingUntil - timeGetTime()) > 0; d++) {
 		RemoveProcessWindows(DyingPids[d]);
+	}
+	if (ClosingCount && (i32)(DyingUntil - timeGetTime()) > 0) {
+		RemoveClosingWindows();
 	}
 	if (Config.groupByApp) AddSnapGroups();
 	Print(L"UpdateApps (%i windows) %llims elapsed\n", windowsCount, FinishMeasuring(start));
@@ -3544,27 +3573,22 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				CloseWindowX(Switcher);
 				goto consumeMessage;
 			}
-			// Alt-Q on a snap group - end every app in it, and pop the group away (Doruk, 2026-11-24)
+			// Alt-Q on a snap group - close just the group's windows (the apps keep running with their
+			// other windows), and pop the group away (Doruk, 2026-11-24)
 			if (keyQDown && SelectedApp && SelectedApp->groupCount) {
 				int index = (int)(SelectedApp - Apps);
 				f32 scale = DockScale(index);
 				struct app group = *SelectedApp; // Before UpdateApps reuses the slot
-				ULONG pids[GROUP_MAX];
-				int ended = 0;
+				int closed = 0;
 				for (iz k = 0; k < group.windowsCount && k < GROUP_MAX; k++) {
-					ULONG pid = 0;
-					GetWindowThreadProcessId(group.windows[k], &pid);
-					bool seen = false;
-					for (int d = 0; d < ended; d++) seen |= pids[d] == pid;
-					if (seen) continue; // Two snapped windows of one app: end it once
-					if (TerminateWindowProcess(group.windows[k])) pids[ended++] = pid;
+					CloseWindowX(group.windows[k]); // Asks politely, like the window's X button
+					ClosingWindows[closed++] = group.windows[k];
 				}
-				if (!ended) goto consumeMessage; // e.g. access denied: leave the switcher as it is
 				handle icons[GROUP_MAX] = {0};
 				for (iz k = 0; k < group.groupCount && k < GROUP_MAX; k++) icons[k] = CopyIcon(group.groupIcons[k]);
 				PreviewReset();
-				for (int d = 0; d < ended; d++) DyingPids[d] = pids[d];
-				DyingCount = ended;
+				ClosingCount = closed;
+				DyingCount = 0;
 				DyingUntil = timeGetTime() + 1000;
 				UpdateApps();
 				if (AppsCount == 0) {
@@ -3608,6 +3632,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				// so the app disappears now instead of lingering (and briefly magnifying)
 				DyingPids[0] = pid;
 				DyingCount = 1;
+				ClosingCount = 0;
 				DyingUntil = timeGetTime() + 1000;
 				UpdateApps();
 				if (AppsCount == 0) {
