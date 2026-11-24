@@ -1811,6 +1811,188 @@ static void ResizeSwitcher(void)
 	}
 }
 
+// ========================================
+// Smooth icons (Doruk, 2026-11-24)
+// ========================================
+// DrawIconEx shrinks a 256 px icon by skipping pixels, which looks jagged at switcher sizes
+// (most visible on a large, low-DPI monitor). Each app's icon is turned into a chain of
+// half-size copies (mipmaps) once, and every draw is area-filtered from the nearest larger copy
+// straight into the switcher's pixels. Old icons that come as a small image in the corner of an
+// empty 256 px square are cropped to that image.
+
+#define SMOOTH_MAX    64
+#define SMOOTH_LEVELS 9
+
+struct smoothicon {
+	string path;
+	i32 levels;
+	i32 size[SMOOTH_LEVELS];
+	u32 *pix[SMOOTH_LEVELS]; // Premultiplied BGRA, size*size each
+	bool failed;             // Couldn't read the icon: draw it with DrawIconEx
+};
+static struct smoothicon SmoothIcons[SMOOTH_MAX];
+static int SmoothCount, SmoothNext;
+
+static void SmoothFree(struct smoothicon *s)
+{
+	for (int i = 0; i < s->levels; i++) free(s->pix[i]);
+	memset(s, 0, sizeof *s);
+}
+
+// Reads an icon's pixels as premultiplied BGRA (square), cropping the empty padding around a small image
+static u32 *SmoothReadIcon(HICON icon, i32 *outSize)
+{
+	ICONINFO ii = {0};
+	if (!GetIconInfo(icon, &ii)) return null;
+	u32 *px = null, *mask = null;
+	BITMAP bm = {0};
+	if (!ii.hbmColor || !GetObjectW(ii.hbmColor, sizeof bm, &bm) || bm.bmWidth != bm.bmHeight || bm.bmWidth <= 0 || bm.bmWidth > 512) goto done;
+	i32 n = bm.bmWidth;
+	BITMAPINFO bi = {.bmiHeader = {.biSize = sizeof bi.bmiHeader, .biWidth = n, .biHeight = -n, .biPlanes = 1, .biBitCount = 32, .biCompression = BI_RGB}};
+	px = malloc((iz)n * n * 4);
+	HDC dc = GetDC(null);
+	bool ok = px && GetDIBits(dc, ii.hbmColor, 0, n, px, &bi, DIB_RGB_COLORS) == n;
+	bool hasAlpha = false;
+	for (iz i = 0; ok && i < (iz)n * n; i++) if (px[i] >> 24) { hasAlpha = true; break; }
+	if (ok && !hasAlpha) { // Old icon without alpha: transparency comes from the mask
+		mask = malloc((iz)n * n * 4);
+		ok = mask && GetDIBits(dc, ii.hbmMask, 0, n, mask, &bi, DIB_RGB_COLORS) == n;
+		for (iz i = 0; ok && i < (iz)n * n; i++) px[i] = (px[i] & 0xFFFFFF) | ((mask[i] & 0xFFFFFF) ? 0u : 0xFF000000u);
+	}
+	ReleaseDC(null, dc);
+	if (!ok) { free(px); px = null; goto done; }
+	// Premultiply, and find where the visible pixels are
+	i32 right = 0, bottom = 0;
+	for (i32 y = 0; y < n; y++) for (i32 x = 0; x < n; x++) {
+		u32 p = px[(iz)y * n + x], a = p >> 24;
+		if (!a) { px[(iz)y * n + x] = 0; continue; }
+		u32 b = (p & 0xFF) * a / 255, g = (p >> 8 & 0xFF) * a / 255, r = (p >> 16 & 0xFF) * a / 255;
+		px[(iz)y * n + x] = a << 24 | r << 16 | g << 8 | b;
+		if (x + 1 > right) right = x + 1;
+		if (y + 1 > bottom) bottom = y + 1;
+	}
+	i32 side = right > bottom ? right : bottom;
+	if (side > 0 && side <= n / 2) { // A small image in the corner of a big empty square: keep just the image
+		for (i32 y = 0; y < side; y++) memmove(&px[(iz)y * side], &px[(iz)y * n], (iz)side * 4);
+		n = side;
+	}
+	*outSize = n;
+done:
+	free(mask);
+	if (ii.hbmColor) DeleteObject(ii.hbmColor);
+	if (ii.hbmMask) DeleteObject(ii.hbmMask);
+	return px;
+}
+
+static struct smoothicon *SmoothGet(string *path, HICON icon)
+{
+	for (int i = 0; i < SmoothCount; i++) {
+		if (StringsAreEqual(path, &SmoothIcons[i].path)) return &SmoothIcons[i];
+	}
+	struct smoothicon *s;
+	if (SmoothCount < SMOOTH_MAX) {
+		s = &SmoothIcons[SmoothCount++];
+	} else {
+		s = &SmoothIcons[SmoothNext];
+		SmoothNext = (SmoothNext + 1) % SMOOTH_MAX;
+		SmoothFree(s);
+	}
+	s->path = *path;
+	i32 n = 0;
+	u32 *px = SmoothReadIcon(icon, &n);
+	if (!px) { s->failed = true; return s; }
+	s->pix[0] = px; s->size[0] = n; s->levels = 1;
+	while (s->levels < SMOOTH_LEVELS && n / 2 >= 8) { // Each level: 2x2 average of the one above
+		i32 m = n / 2;
+		u32 *src = s->pix[s->levels - 1], *dst = malloc((iz)m * m * 4);
+		if (!dst) break;
+		for (i32 y = 0; y < m; y++) for (i32 x = 0; x < m; x++) {
+			u32 q[4] = {src[(iz)(2 * y) * n + 2 * x], src[(iz)(2 * y) * n + 2 * x + 1], src[(iz)(2 * y + 1) * n + 2 * x], src[(iz)(2 * y + 1) * n + 2 * x + 1]};
+			u32 out = 0;
+			for (int k = 24; k >= 0; k -= 8) out = out << 8 | (((q[0] >> k & 0xFF) + (q[1] >> k & 0xFF) + (q[2] >> k & 0xFF) + (q[3] >> k & 0xFF) + 2) >> 2);
+			dst[(iz)y * m + x] = out;
+		}
+		s->pix[s->levels] = dst; s->size[s->levels] = m; s->levels++;
+		n = m;
+	}
+	return s;
+}
+
+struct smoothtap { i32 i0, n; f32 w[4]; };
+
+// Filter taps for one axis: area average when shrinking (ratio 1..2), linear when enlarging
+static void SmoothTaps(struct smoothtap *taps, i32 dst, i32 src)
+{
+	f32 r = (f32)src / dst;
+	for (i32 d = 0; d < dst; d++) {
+		struct smoothtap *t = &taps[d];
+		memset(t, 0, sizeof *t);
+		if (r >= 1) {
+			f32 a = d * r, b = a + r;
+			t->i0 = (i32)a;
+			for (i32 i = t->i0; i < src && (f32)i < b && t->n < 4; i++) {
+				f32 lo = a > i ? a : (f32)i, hi = b < i + 1 ? b : (f32)(i + 1);
+				t->w[t->n++] = (hi - lo) / r;
+			}
+		} else {
+			f32 c = (d + 0.5f) * r - 0.5f;
+			if (c < 0) c = 0;
+			i32 i = (i32)c;
+			f32 f = c - i;
+			t->i0 = i;
+			t->w[0] = 1 - f; t->n = 1;
+			if (i + 1 < src) { t->w[1] = f; t->n = 2; } else t->w[0] = 1;
+		}
+	}
+}
+
+// Draws an app's icon area-filtered into the switcher's pixels; false means use DrawIconEx instead
+static bool DrawIconSmooth(string *path, HICON icon, i32 left, i32 top, i32 size)
+{
+	if (!DrawingPixels || !icon || size <= 0 || size > 1024) return false;
+	struct smoothicon *s = SmoothGet(path, icon);
+	if (!s || s->failed || s->levels <= 0) return false;
+	int L = 0; // Smallest copy that is still at least as big as the target
+	while (L + 1 < s->levels && s->size[L + 1] >= size) L++;
+	i32 n = s->size[L];
+	u32 *src = s->pix[L];
+	struct smoothtap taps[1024];
+	SmoothTaps(taps, size, n);
+	i32 w = DrawingDims.drawRect.right - DrawingDims.drawRect.left;
+	i32 h = DrawingDims.drawRect.bottom - DrawingDims.drawRect.top;
+	GdiFlush();
+	for (i32 dy = 0; dy < size; dy++) {
+		i32 y = top + dy;
+		if (y < 0 || y >= h) continue;
+		struct smoothtap *ty = &taps[dy];
+		for (i32 dx = 0; dx < size; dx++) {
+			i32 x = left + dx;
+			if (x < 0 || x >= w) continue;
+			struct smoothtap *tx = &taps[dx];
+			f32 c[4] = {0};
+			for (i32 j = 0; j < ty->n; j++) {
+				u32 *row = &src[(iz)(ty->i0 + j) * n + tx->i0];
+				for (i32 i = 0; i < tx->n; i++) {
+					u32 p = row[i];
+					if (!p) continue;
+					f32 wt = ty->w[j] * tx->w[i];
+					c[0] += wt * (p & 0xFF); c[1] += wt * (p >> 8 & 0xFF); c[2] += wt * (p >> 16 & 0xFF); c[3] += wt * (p >> 24);
+				}
+			}
+			if (c[3] < 0.5f) continue;
+			u32 *d = &DrawingPixels[(iz)y * w + x];
+			f32 inv = 1 - c[3] / 255;
+			u32 out = *d & 0xFF000000u; // Keep the switcher's own alpha byte
+			for (int k = 0; k < 3; k++) {
+				f32 v = c[k] + (f32)(*d >> (8 * k) & 0xFF) * inv;
+				out |= (u32)(v > 255 ? 255 : v + 0.5f) << (8 * k);
+			}
+			*d = out;
+		}
+	}
+	return true;
+}
+
 static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 {
 	u32 ICON_WIDTH = DrawingDims.iconSize;
@@ -1874,11 +2056,13 @@ static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 		}
 		if (glow) GlassGlow(glowRect, (i32)(width * 0.22f), (i32)(s * 9 * glowBoost), glowColor, claude ? 1.0f : 0.85f);
 		RoundRect(DrawingContext, selRect.left, selRect.top, selRect.right, selRect.bottom, SEL_RADIUS, SEL_RADIUS);
-		DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, glass ? null : backgroundBrush, DI_NORMAL);
+		if (width != height || !DrawIconSmooth(&app->path, app->icon, appRect.left, appRect.top, width))
+			DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, glass ? null : backgroundBrush, DI_NORMAL);
 	} else {
 		// Draw icon straight onto the background (the glass shows around its edges)
 		if (glow) GlassGlow(glowRect, (i32)(width * 0.22f), (i32)(s * 8 * glowBoost), glowColor, claude ? 1.0f : 0.7f);
-		DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, GlassBack ? null : backgroundBrush, DI_NORMAL);
+		if (width != height || !DrawIconSmooth(&app->path, app->icon, appRect.left, appRect.top, width))
+			DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, GlassBack ? null : backgroundBrush, DI_NORMAL);
 	}
 
 	if ((isSelected && !hasMouseover) || isMouseover) {
