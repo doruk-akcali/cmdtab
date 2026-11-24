@@ -967,11 +967,15 @@ static RECT        DockRects[128];  // Icon rectangles of the last layout, paral
 // Pop: an app closed with Alt-Q swells and shrinks away while its gap closes
 #define POP_MS          260
 static handle      PopIcon;         // Copy of the closed app's icon (app icons are destroyed on slot reuse)
+static handle      PopExtra[3];     // A closed snap group's other icons (copies)
+static int         PopCount = 1;    // Icons in the pop: 1, or a snap group's count
+static f32         PopUnits = 1;    // Width of the closed entry, in icon widths
 static int         PopIndex = -1;   // Where its gap sits in 'Apps' (before this index); -1 when no pop is running
 static f32         PopScale;        // Its magnification when it was closed
 static u32         PopStart;
 static RECT        PopRect;         // Where to draw it this frame (set by DockLayout)
-static ULONG       DyingPid;        // Process just terminated with Alt-Q: its windows are left out of
+static ULONG       DyingPids[4];    // Processes just terminated with Alt-Q: their windows are left out of
+static int         DyingCount;
 static u32         DyingUntil;      // the app list until this time, even if Windows still lists them
 
 
@@ -1781,8 +1785,8 @@ static void UpdateApps(void)
 	for (int i = HistoryCount-1; i >= 0; i--) {
 		ActivateWindow(History[i]);
 	}
-	if (DyingPid && (i32)(DyingUntil - timeGetTime()) > 0) {
-		RemoveProcessWindows(DyingPid);
+	for (int d = 0; d < DyingCount && (i32)(DyingUntil - timeGetTime()) > 0; d++) {
+		RemoveProcessWindows(DyingPids[d]);
 	}
 	if (Config.groupByApp) AddSnapGroups();
 	Print(L"UpdateApps (%i windows) %llims elapsed\n", windowsCount, FinishMeasuring(start));
@@ -2343,7 +2347,7 @@ static void DockLayout(void)
 		f32 grow = t < 0.3f ? 1 + 0.18f * DockEase(t / 0.3f) : 1.18f * (1 - ((t - 0.3f) / 0.7f) * ((t - 0.3f) / 0.7f));
 		popSize = ICON_WIDTH * PopScale * grow;
 		// The gap follows the icon (never wider than its slot), so neighbours close in without covering it
-		gap = (ICON_PAD + ICON_WIDTH * PopScale + ICON_PAD) * (grow < 1 ? grow : 1);
+		gap = (ICON_PAD + ICON_WIDTH * PopScale * PopUnits + ICON_PAD) * (grow < 1 ? grow : 1);
 	}
 
 	f32 rowWidth = gap;
@@ -2357,10 +2361,10 @@ static void DockLayout(void)
 		if (i == PopIndex) {
 			// The popping icon stays centered in its gap, on the same baseline
 			f32 center = x + gap / 2;
-			PopRect.left   = (i32)(center - popSize / 2 + 0.5f);
-			PopRect.right  = PopRect.left + (i32)(popSize + 0.5f);
+			PopRect.left   = (i32)(center - popSize * PopUnits / 2 + 0.5f);
+			PopRect.right  = PopRect.left + (i32)(popSize * PopUnits + 0.5f);
 			PopRect.bottom = baseline - (i32)((ICON_WIDTH * PopScale - popSize) / 2);
-			PopRect.top    = PopRect.bottom - (PopRect.right - PopRect.left);
+			PopRect.top    = PopRect.bottom - (i32)(popSize + 0.5f);
 			x += gap;
 		}
 		if (i == AppsCount) break;
@@ -2422,6 +2426,9 @@ static void PopEnd(void)
 {
 	if (PopIcon) DestroyIcon(PopIcon);
 	PopIcon = null;
+	for (int k = 0; k < 3; k++) { if (PopExtra[k]) DestroyIcon(PopExtra[k]); PopExtra[k] = null; }
+	PopCount = 1;
+	PopUnits = 1;
 	PopIndex = -1;
 }
 
@@ -3143,7 +3150,12 @@ static void RedrawSwitcher(void)
 
 	// The popping icon goes under the others
 	if (PopIndex >= 0 && PopIcon && PopRect.right > PopRect.left) {
-		DrawIconEx(DrawingContext, PopRect.left, PopRect.top, PopIcon, PopRect.right - PopRect.left, PopRect.bottom - PopRect.top, 0, GlassBack ? null : DrawingBg, DI_NORMAL);
+		i32 popSize = PopRect.bottom - PopRect.top;
+		for (int k = 0; k < PopCount; k++) { // A snap group pops as a whole, its icons side by side
+			handle icon = k ? PopExtra[k - 1] : PopIcon;
+			i32 x = PopRect.left + (i32)(k * popSize * (1 + GROUP_GAP) + 0.5f);
+			if (icon) DrawIconEx(DrawingContext, x, PopRect.top, icon, popSize, popSize, 0, GlassBack ? null : DrawingBg, DI_NORMAL);
+		}
 	}
 
 	for (int i = 0; i < AppsCount && i < countof(DockRects); i++) {
@@ -3532,8 +3544,45 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				CloseWindowX(Switcher);
 				goto consumeMessage;
 			}
-			// Quit/close/minimize/hide don't apply to a snap group entry (it is several apps)
-			if (SelectedApp && SelectedApp->groupCount && (keyQDown || keyWDown || deleteDown || keyMDown || keyHDown)) {
+			// Alt-Q on a snap group - end every app in it, and pop the group away (Doruk, 2026-11-24)
+			if (keyQDown && SelectedApp && SelectedApp->groupCount) {
+				int index = (int)(SelectedApp - Apps);
+				f32 scale = DockScale(index);
+				struct app group = *SelectedApp; // Before UpdateApps reuses the slot
+				ULONG pids[GROUP_MAX];
+				int ended = 0;
+				for (iz k = 0; k < group.windowsCount && k < GROUP_MAX; k++) {
+					ULONG pid = 0;
+					GetWindowThreadProcessId(group.windows[k], &pid);
+					bool seen = false;
+					for (int d = 0; d < ended; d++) seen |= pids[d] == pid;
+					if (seen) continue; // Two snapped windows of one app: end it once
+					if (TerminateWindowProcess(group.windows[k])) pids[ended++] = pid;
+				}
+				if (!ended) goto consumeMessage; // e.g. access denied: leave the switcher as it is
+				handle icons[GROUP_MAX] = {0};
+				for (iz k = 0; k < group.groupCount && k < GROUP_MAX; k++) icons[k] = CopyIcon(group.groupIcons[k]);
+				PreviewReset();
+				for (int d = 0; d < ended; d++) DyingPids[d] = pids[d];
+				DyingCount = ended;
+				DyingUntil = timeGetTime() + 1000;
+				UpdateApps();
+				if (AppsCount == 0) {
+					for (int k = 0; k < GROUP_MAX; k++) if (icons[k]) DestroyIcon(icons[k]);
+					HideSwitcher();
+					goto consumeMessage;
+				}
+				if (SelectedApp >= &Apps[AppsCount]) SelectedApp = &Apps[AppsCount-1];
+				SelectedWindow = &SelectedApp->windows[0];
+				PopBegin(icons[0], index, scale);
+				PopCount = (int)(group.groupCount < GROUP_MAX ? group.groupCount : GROUP_MAX);
+				PopUnits = AppUnits(&group);
+				for (int k = 1; k < PopCount; k++) PopExtra[k - 1] = icons[k];
+				RedrawSwitcher();
+				goto consumeMessage;
+			}
+			// Close/minimize/hide don't apply to a snap group entry (it is several apps)
+			if (SelectedApp && SelectedApp->groupCount && (keyWDown || deleteDown || keyMDown || keyHDown)) {
 				goto consumeMessage;
 			}
 			// Alt-Q - close all windows of selected application
@@ -3557,7 +3606,8 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				PreviewReset(); // The app list changes under it
 				// Leave the dying process out even while Windows still lists its windows,
 				// so the app disappears now instead of lingering (and briefly magnifying)
-				DyingPid = pid;
+				DyingPids[0] = pid;
+				DyingCount = 1;
 				DyingUntil = timeGetTime() + 1000;
 				UpdateApps();
 				if (AppsCount == 0) {
