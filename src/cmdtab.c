@@ -307,6 +307,60 @@ static string GetExePath(handle hwnd)
 	return path;
 }
 
+// Doruk's Claude Telegram bot (2026-11-21): its console window is marked with this window
+// property by TelegramWindow.exe. cmdtab lists it as one of the Claude app's windows (instead
+// of a separate console app) and gives the Claude icon a blue glow while it is open.
+static bool IsClaudeBotWindow(handle hwnd)
+{
+	return GetPropW(hwnd, L"CmdtabGroupWithClaude") != null;
+}
+
+static string ClaudeAppPath;
+
+// Finds the running Claude app's exe by process, so it also works while Claude's window is hidden in the tray
+static void FindClaudeAppPath(void)
+{
+	handle snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) return;
+	PROCESSENTRY32W entry = {.dwSize = sizeof entry};
+	for (BOOL more = Process32FirstW(snapshot, &entry); more; more = Process32NextW(snapshot, &entry)) {
+		if (_wcsicmp(entry.szExeFile, L"Claude.exe")) continue;
+		handle process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, entry.th32ProcessID);
+		if (!process) continue;
+		string p = {0};
+		ULONG length = countof(p.text);
+		if (QueryFullProcessImageNameW(process, 0, p.text, &length) && StrStrIW(p.text, L"\\WindowsApps\\Claude_")) {
+			p.length = (i16)length;
+			ClaudeAppPath = p;
+		}
+		CloseHandle(process);
+		if (ClaudeAppPath.length > 0) break;
+	}
+	CloseHandle(snapshot);
+}
+
+// Is this exe path the Claude desktop app (Store install)?
+static bool IsClaudeAppPath(const u16 *path)
+{
+	return StrStrIW(path, L"\\WindowsApps\\Claude_") && !_wcsicmp(PathFindFileNameW(path), L"claude.exe");
+}
+
+// Exe path used to group a window into an app; the bot window borrows the Claude app's path
+static string GetGroupingExePath(handle hwnd)
+{
+	string path = GetExePath(hwnd);
+	if (path.length > 0 && IsClaudeBotWindow(hwnd)) {
+		// Looked up afresh each time (once per Alt+Tab): Claude updates itself into a new
+		// versioned folder, and the old folder can linger, so a cached path goes stale
+		string previous = ClaudeAppPath;
+		ClaudeAppPath.length = 0;
+		FindClaudeAppPath();
+		if (ClaudeAppPath.length <= 0) ClaudeAppPath = previous; // Claude not running: keep the last known path
+		if (ClaudeAppPath.length > 0) return ClaudeAppPath;
+	}
+	return path;
+}
+
 static string GetWindowTitle(handle hwnd)
 {
 	string title = {0};
@@ -1016,6 +1070,7 @@ static i32  GlassBackW, GlassBackH;
 static LRESULT CALLBACK PreviewWindowProcedure(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 static handle Preview;              // Window-preview panel above the switcher (see "Window previews")
 static const COLORREF MultiGlowColor = RGB(170, 105, 255); // Glow around apps with several windows
+static const COLORREF BotGlowColor = RGB(56, 152, 255); // Blue halo on Claude while its Telegram bot window is open
 
 static void GlassBoxBlur(u32 *src, u32 *dst, i32 w, i32 h, i32 r, bool vertical) // One box pass, clamped edges
 {
@@ -1413,7 +1468,7 @@ static void AddToApps(handle hwnd)
 		return;
 	}
 	// 3. Get module filepath, abort if failed (most likely access denied)
-	string filepath = GetExePath(hwnd);
+	string filepath = GetGroupingExePath(hwnd);
 	if (filepath.length <= 0) {
 		return; // Don't have to print error, since GetExePath already does that
 	}
@@ -1756,6 +1811,188 @@ static void ResizeSwitcher(void)
 	}
 }
 
+// ========================================
+// Smooth icons (Doruk, 2026-11-24)
+// ========================================
+// DrawIconEx shrinks a 256 px icon by skipping pixels, which looks jagged at switcher sizes
+// (most visible on a large, low-DPI monitor). Each app's icon is turned into a chain of
+// half-size copies (mipmaps) once, and every draw is area-filtered from the nearest larger copy
+// straight into the switcher's pixels. Old icons that come as a small image in the corner of an
+// empty 256 px square are cropped to that image.
+
+#define SMOOTH_MAX    64
+#define SMOOTH_LEVELS 9
+
+struct smoothicon {
+	string path;
+	i32 levels;
+	i32 size[SMOOTH_LEVELS];
+	u32 *pix[SMOOTH_LEVELS]; // Premultiplied BGRA, size*size each
+	bool failed;             // Couldn't read the icon: draw it with DrawIconEx
+};
+static struct smoothicon SmoothIcons[SMOOTH_MAX];
+static int SmoothCount, SmoothNext;
+
+static void SmoothFree(struct smoothicon *s)
+{
+	for (int i = 0; i < s->levels; i++) free(s->pix[i]);
+	memset(s, 0, sizeof *s);
+}
+
+// Reads an icon's pixels as premultiplied BGRA (square), cropping the empty padding around a small image
+static u32 *SmoothReadIcon(HICON icon, i32 *outSize)
+{
+	ICONINFO ii = {0};
+	if (!GetIconInfo(icon, &ii)) return null;
+	u32 *px = null, *mask = null;
+	BITMAP bm = {0};
+	if (!ii.hbmColor || !GetObjectW(ii.hbmColor, sizeof bm, &bm) || bm.bmWidth != bm.bmHeight || bm.bmWidth <= 0 || bm.bmWidth > 512) goto done;
+	i32 n = bm.bmWidth;
+	BITMAPINFO bi = {.bmiHeader = {.biSize = sizeof bi.bmiHeader, .biWidth = n, .biHeight = -n, .biPlanes = 1, .biBitCount = 32, .biCompression = BI_RGB}};
+	px = malloc((iz)n * n * 4);
+	HDC dc = GetDC(null);
+	bool ok = px && GetDIBits(dc, ii.hbmColor, 0, n, px, &bi, DIB_RGB_COLORS) == n;
+	bool hasAlpha = false;
+	for (iz i = 0; ok && i < (iz)n * n; i++) if (px[i] >> 24) { hasAlpha = true; break; }
+	if (ok && !hasAlpha) { // Old icon without alpha: transparency comes from the mask
+		mask = malloc((iz)n * n * 4);
+		ok = mask && GetDIBits(dc, ii.hbmMask, 0, n, mask, &bi, DIB_RGB_COLORS) == n;
+		for (iz i = 0; ok && i < (iz)n * n; i++) px[i] = (px[i] & 0xFFFFFF) | ((mask[i] & 0xFFFFFF) ? 0u : 0xFF000000u);
+	}
+	ReleaseDC(null, dc);
+	if (!ok) { free(px); px = null; goto done; }
+	// Premultiply, and find where the visible pixels are
+	i32 right = 0, bottom = 0;
+	for (i32 y = 0; y < n; y++) for (i32 x = 0; x < n; x++) {
+		u32 p = px[(iz)y * n + x], a = p >> 24;
+		if (!a) { px[(iz)y * n + x] = 0; continue; }
+		u32 b = (p & 0xFF) * a / 255, g = (p >> 8 & 0xFF) * a / 255, r = (p >> 16 & 0xFF) * a / 255;
+		px[(iz)y * n + x] = a << 24 | r << 16 | g << 8 | b;
+		if (x + 1 > right) right = x + 1;
+		if (y + 1 > bottom) bottom = y + 1;
+	}
+	i32 side = right > bottom ? right : bottom;
+	if (side > 0 && side <= n / 2) { // A small image in the corner of a big empty square: keep just the image
+		for (i32 y = 0; y < side; y++) memmove(&px[(iz)y * side], &px[(iz)y * n], (iz)side * 4);
+		n = side;
+	}
+	*outSize = n;
+done:
+	free(mask);
+	if (ii.hbmColor) DeleteObject(ii.hbmColor);
+	if (ii.hbmMask) DeleteObject(ii.hbmMask);
+	return px;
+}
+
+static struct smoothicon *SmoothGet(string *path, HICON icon)
+{
+	for (int i = 0; i < SmoothCount; i++) {
+		if (StringsAreEqual(path, &SmoothIcons[i].path)) return &SmoothIcons[i];
+	}
+	struct smoothicon *s;
+	if (SmoothCount < SMOOTH_MAX) {
+		s = &SmoothIcons[SmoothCount++];
+	} else {
+		s = &SmoothIcons[SmoothNext];
+		SmoothNext = (SmoothNext + 1) % SMOOTH_MAX;
+		SmoothFree(s);
+	}
+	s->path = *path;
+	i32 n = 0;
+	u32 *px = SmoothReadIcon(icon, &n);
+	if (!px) { s->failed = true; return s; }
+	s->pix[0] = px; s->size[0] = n; s->levels = 1;
+	while (s->levels < SMOOTH_LEVELS && n / 2 >= 8) { // Each level: 2x2 average of the one above
+		i32 m = n / 2;
+		u32 *src = s->pix[s->levels - 1], *dst = malloc((iz)m * m * 4);
+		if (!dst) break;
+		for (i32 y = 0; y < m; y++) for (i32 x = 0; x < m; x++) {
+			u32 q[4] = {src[(iz)(2 * y) * n + 2 * x], src[(iz)(2 * y) * n + 2 * x + 1], src[(iz)(2 * y + 1) * n + 2 * x], src[(iz)(2 * y + 1) * n + 2 * x + 1]};
+			u32 out = 0;
+			for (int k = 24; k >= 0; k -= 8) out = out << 8 | (((q[0] >> k & 0xFF) + (q[1] >> k & 0xFF) + (q[2] >> k & 0xFF) + (q[3] >> k & 0xFF) + 2) >> 2);
+			dst[(iz)y * m + x] = out;
+		}
+		s->pix[s->levels] = dst; s->size[s->levels] = m; s->levels++;
+		n = m;
+	}
+	return s;
+}
+
+struct smoothtap { i32 i0, n; f32 w[4]; };
+
+// Filter taps for one axis: area average when shrinking (ratio 1..2), linear when enlarging
+static void SmoothTaps(struct smoothtap *taps, i32 dst, i32 src)
+{
+	f32 r = (f32)src / dst;
+	for (i32 d = 0; d < dst; d++) {
+		struct smoothtap *t = &taps[d];
+		memset(t, 0, sizeof *t);
+		if (r >= 1) {
+			f32 a = d * r, b = a + r;
+			t->i0 = (i32)a;
+			for (i32 i = t->i0; i < src && (f32)i < b && t->n < 4; i++) {
+				f32 lo = a > i ? a : (f32)i, hi = b < i + 1 ? b : (f32)(i + 1);
+				t->w[t->n++] = (hi - lo) / r;
+			}
+		} else {
+			f32 c = (d + 0.5f) * r - 0.5f;
+			if (c < 0) c = 0;
+			i32 i = (i32)c;
+			f32 f = c - i;
+			t->i0 = i;
+			t->w[0] = 1 - f; t->n = 1;
+			if (i + 1 < src) { t->w[1] = f; t->n = 2; } else t->w[0] = 1;
+		}
+	}
+}
+
+// Draws an app's icon area-filtered into the switcher's pixels; false means use DrawIconEx instead
+static bool DrawIconSmooth(string *path, HICON icon, i32 left, i32 top, i32 size)
+{
+	if (!DrawingPixels || !icon || size <= 0 || size > 1024) return false;
+	struct smoothicon *s = SmoothGet(path, icon);
+	if (!s || s->failed || s->levels <= 0) return false;
+	int L = 0; // Smallest copy that is still at least as big as the target
+	while (L + 1 < s->levels && s->size[L + 1] >= size) L++;
+	i32 n = s->size[L];
+	u32 *src = s->pix[L];
+	struct smoothtap taps[1024];
+	SmoothTaps(taps, size, n);
+	i32 w = DrawingDims.drawRect.right - DrawingDims.drawRect.left;
+	i32 h = DrawingDims.drawRect.bottom - DrawingDims.drawRect.top;
+	GdiFlush();
+	for (i32 dy = 0; dy < size; dy++) {
+		i32 y = top + dy;
+		if (y < 0 || y >= h) continue;
+		struct smoothtap *ty = &taps[dy];
+		for (i32 dx = 0; dx < size; dx++) {
+			i32 x = left + dx;
+			if (x < 0 || x >= w) continue;
+			struct smoothtap *tx = &taps[dx];
+			f32 c[4] = {0};
+			for (i32 j = 0; j < ty->n; j++) {
+				u32 *row = &src[(iz)(ty->i0 + j) * n + tx->i0];
+				for (i32 i = 0; i < tx->n; i++) {
+					u32 p = row[i];
+					if (!p) continue;
+					f32 wt = ty->w[j] * tx->w[i];
+					c[0] += wt * (p & 0xFF); c[1] += wt * (p >> 8 & 0xFF); c[2] += wt * (p >> 16 & 0xFF); c[3] += wt * (p >> 24);
+				}
+			}
+			if (c[3] < 0.5f) continue;
+			u32 *d = &DrawingPixels[(iz)y * w + x];
+			f32 inv = 1 - c[3] / 255;
+			u32 out = *d & 0xFF000000u; // Keep the switcher's own alpha byte
+			for (int k = 0; k < 3; k++) {
+				f32 v = c[k] + (f32)(*d >> (8 * k) & 0xFF) * inv;
+				out |= (u32)(v > 255 ? 255 : v + 0.5f) << (8 * k);
+			}
+			*d = out;
+		}
+	}
+	return true;
+}
+
 static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 {
 	u32 ICON_WIDTH = DrawingDims.iconSize;
@@ -1799,7 +2036,15 @@ static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 
 	RECT selRect = {appRect.left - SEL_VERT_OFF, appRect.top - SEL_HORZ_OFF, appRect.right + SEL_VERT_OFF, appRect.bottom + SEL_HORZ_OFF};
 	// Several windows: a purple glow around the icon (on the glass, under the icon)
-	bool glow = GlassBack != null && app->windowsCount > 1;
+	// The Claude Telegram bot window turns the glow blue (a halo on the Claude icon)
+	bool bot = false;
+	for (int j = 0; j < app->windowsCount; j++) {
+		if (IsClaudeBotWindow(app->windows[j])) { bot = true; break; }
+	}
+	bool claude = bot || IsClaudeAppPath(app->path.text); // Claude always has a blue halo, a bit stronger than the purple one
+	bool glow = GlassBack != null && (app->windowsCount > 1 || claude);
+	COLORREF glowColor = claude ? BotGlowColor : MultiGlowColor;
+	f32 glowBoost = claude ? 1.4f : 1.0f;
 	f32 s = DrawingDims.drawScale;
 	RECT glowRect = {appRect.left + (i32)(s * 2), appRect.top + (i32)(s * 2), appRect.right - (i32)(s * 2), appRect.bottom - (i32)(s * 2)};
 	if (isSelected || isMouseover) {
@@ -1809,13 +2054,15 @@ static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 			GlassDarken(selRect, SEL_RADIUS, 0.45f);
 			SelectObject(DrawingContext, GetStockObject(NULL_BRUSH));
 		}
-		if (glow) GlassGlow(glowRect, (i32)(width * 0.22f), (i32)(s * 9), MultiGlowColor, 0.85f);
+		if (glow) GlassGlow(glowRect, (i32)(width * 0.22f), (i32)(s * 9 * glowBoost), glowColor, claude ? 1.0f : 0.85f);
 		RoundRect(DrawingContext, selRect.left, selRect.top, selRect.right, selRect.bottom, SEL_RADIUS, SEL_RADIUS);
-		DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, glass ? null : backgroundBrush, DI_NORMAL);
+		if (width != height || !DrawIconSmooth(&app->path, app->icon, appRect.left, appRect.top, width))
+			DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, glass ? null : backgroundBrush, DI_NORMAL);
 	} else {
 		// Draw icon straight onto the background (the glass shows around its edges)
-		if (glow) GlassGlow(glowRect, (i32)(width * 0.22f), (i32)(s * 8), MultiGlowColor, 0.7f);
-		DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, GlassBack ? null : backgroundBrush, DI_NORMAL);
+		if (glow) GlassGlow(glowRect, (i32)(width * 0.22f), (i32)(s * 8 * glowBoost), glowColor, claude ? 1.0f : 0.7f);
+		if (width != height || !DrawIconSmooth(&app->path, app->icon, appRect.left, appRect.top, width))
+			DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, GlassBack ? null : backgroundBrush, DI_NORMAL);
 	}
 
 	if ((isSelected && !hasMouseover) || isMouseover) {
@@ -2081,8 +2328,20 @@ static void SlideCapture(handle hwnd)
 
 // Called just before 'target' is activated: put the snapshot on screen where
 // the old window is, then let the timer slide it away
+// Picking Claude goes to the Claude app's own window, never the Telegram bot console grouped
+// under it; Alt+T (KeepSelectedWindow) and Alt+` (which walks windows) are the ways to the bot
+static bool KeepSelectedWindow;
+static void ClaudeRedirect(void)
+{
+	if (KeepSelectedWindow || !SelectedApp || !SelectedWindow || !IsClaudeBotWindow(*SelectedWindow)) return;
+	for (int j = 0; j < SelectedApp->windowsCount; j++) {
+		if (!IsClaudeBotWindow(SelectedApp->windows[j])) { SelectedWindow = &SelectedApp->windows[j]; return; }
+	}
+}
+
 static void SlideBegin(handle target)
 {
+	if (SelectedWindow && target == *SelectedWindow) { ClaudeRedirect(); target = *SelectedWindow; }
 	if (!SlideBitmap || SlideAnimating) return;
 	if (GetAppHost(target) == SlideFromWindow || target == SlideFromWindow) {
 		SlideDiscard(); // Same window, nothing to uncover
@@ -2436,7 +2695,7 @@ static void PreviewTick(void)
 		} else if (PreviewDir < 0) {
 			PreviewDir = 1; // Came back while it was closing: open again from where it is
 		}
-	} else if (WantApp && WantApp->windowsCount > 1 && settled && Config.groupByApp) {
+	} else if (WantApp && WantApp->windowsCount > 1 && settled && Config.groupByApp && !IsClaudeAppPath(WantApp->path.text)) {
 		PreviewOpen(WantApp);
 	}
 	if (!PreviewApp) return;
@@ -2758,6 +3017,7 @@ static void ShowSelectedWindow(void)
 	RedrawSwitcher();
 	///*dbg*/Print(L"RedrawSwitcher %llims elapsed\n", FinishMeasuring(start));
 	ReceiveLastInputEvent();
+	ClaudeRedirect();
 	ShowWindowX(*SelectedWindow);
 }
 
@@ -2774,6 +3034,7 @@ static void HideSwitcher(void)
 	SelectedApp = null;
 	SelectedWindow = null;
 	MouseApp = null;
+	KeepSelectedWindow = false;
 }
 
 //static void CloseWindows(handle hwnd) // Alternative to TerminateWindowProcess
@@ -2856,6 +3117,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			}
 			SelectFirstApp(); // Initialize selection
 			SlideDiscard(); // A slide still running from the last switch ends here
+			KeepSelectedWindow = false;
 			if (*SelectedWindow == GetCoreWindow(GetForegroundWindow())) { // Don't select next when on blank desktop
 				if (!Config.fastSwitchingForApps) {
 					SlideCapture(GetForegroundWindow());
@@ -2885,6 +3147,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				goto passMessage;
 			}
 			SelectFirstApp(); // Initialize selection
+			KeepSelectedWindow = true; // Walking windows: the bot window is a valid stop
 			SelectNextWindow(shiftHeld, !keyRepeat || !Config.wrapbump);
 			if (Config.fastSwitchingForWindows) {
 				ShowSelectedWindow();
@@ -2953,7 +3216,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 						PreviewSetSel((int)((PreviewSel + (back ? PreviewCount - 1 : 1)) % PreviewCount));
 						handled = true;
 					}
-				} else if (upDown && SelectedApp && SelectedApp->windowsCount > 1 && Config.groupByApp && Config.showSwitcherForApps) {
+				} else if (upDown && SelectedApp && SelectedApp->windowsCount > 1 && Config.groupByApp && Config.showSwitcherForApps && !IsClaudeAppPath(SelectedApp->path.text)) {
 					PreviewOpenNow();
 					handled = true;
 				}
@@ -3019,6 +3282,24 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			bool keyHDown   = keyCode == 'H' && keyDown;
 			bool keyBUp     = keyCode == 'B' && !keyDown;
 			bool keyGDown   = keyCode == 'G' && keyDown;
+			bool keyTDown   = keyCode == 'T' && keyDown;
+
+			// Alt-T on Claude (selected, or under the mouse) - switch to the Claude Telegram bot window
+			if (keyTDown) {
+				struct app *app = MouseApp ? MouseApp : SelectedApp;
+				for (int j = 0; app && j < app->windowsCount; j++) {
+					if (IsClaudeBotWindow(app->windows[j])) {
+						SelectedApp = app;
+						SelectedWindow = &app->windows[j];
+						KeepSelectedWindow = true;
+						SlideBegin(*SelectedWindow);
+						ShowSelectedWindow();
+						HideSwitcher();
+						break;
+					}
+				}
+				goto consumeMessage;
+			}
 
 			// Alt-F4 - quit cmdtab
 			if (keyF4Down) {
@@ -3031,9 +3312,15 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				int index = (int)(SelectedApp - Apps);
 				string path = SelectedApp->path;
 				f32 scale = DockScale(index);
+				// Quit the Claude app itself, not the Telegram bot console grouped under it
+				handle target = *SelectedWindow;
+				for (int j = 0; IsClaudeBotWindow(target) && j < SelectedApp->windowsCount; j++) {
+					target = SelectedApp->windows[j];
+				}
+				if (IsClaudeBotWindow(target)) target = *SelectedWindow; // Only the bot is listed
 				ULONG pid = 0;
-				GetWindowThreadProcessId(*SelectedWindow, &pid);
-				if (!TerminateWindowProcess(*SelectedWindow)) {
+				GetWindowThreadProcessId(target, &pid);
+				if (!TerminateWindowProcess(target)) {
 					goto consumeMessage; // e.g. access denied: leave the switcher as it is
 				}
 				handle icon = CopyIcon(SelectedApp->icon); // Before UpdateApps may reuse the slot
