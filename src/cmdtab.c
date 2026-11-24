@@ -1613,8 +1613,8 @@ static void RemoveProcessWindows(ULONG pid)
 // Snap groups (Doruk, 2026-11-24)
 // ========================================
 // Like the taskbar's snap groups: windows snapped side by side (Snap Layouts) that together fill
-// a monitor get an extra entry, drawn as their apps' icons close together, which brings them
-// all back at once. Windows doesn't expose its own snap groups, so a group is: two to four
+// a monitor get one entry instead of their apps, drawn as the apps' icons close together, which
+// brings them all back at once. Windows doesn't expose its own snap groups, so a group is: two to four
 // arranged (snapped) windows on one monitor, not overlapping, covering at least 85% of its work
 // area, picked in order of recent use.
 
@@ -1704,8 +1704,8 @@ static void AddSnapGroups(void)
 			if (wrote > 0) g->title.length = (i16)(len + wrote);
 		}
 		g->count = count;
-		// In use right now: after its apps (Alt+Tab goes elsewhere first). Otherwise: just before its most recent app
-		g->pos = active ? maxApp + 1 : (minApp < 1 ? 1 : minApp);
+		(void)active; (void)maxApp;
+		g->pos = minApp; // Takes the place of its most recently used app
 	}
 
 	// Insert from the back, so earlier positions stay valid
@@ -1735,6 +1735,30 @@ static void AddSnapGroups(void)
 			e->groupPaths[m] = g->paths[m];
 		}
 		Log(L"snap group of %i windows at %i\n", g->count, pos);
+	}
+
+	// A grouped window shows only in its group (Doruk, 2026-11-24): take it out of its app, and drop
+	// apps left with no windows. An app that still has other, ungrouped windows stays for those.
+	// Dropped slots rotate to the end, so each icon stays owned by exactly one slot.
+	if (!specCount) return;
+	for (int i = 0; i < AppsCount; i++) {
+		struct app *app = &Apps[i];
+		if (app->groupCount) continue;
+		iz kept = 0;
+		for (iz j = 0; j < app->windowsCount; j++) {
+			bool grouped = false;
+			for (int a = 0; a < specCount && !grouped; a++)
+				for (int m = 0; m < specs[a].count && !grouped; m++) grouped = specs[a].windows[m] == app->windows[j];
+			if (!grouped) app->windows[kept++] = app->windows[j];
+		}
+		app->windowsCount = kept;
+		if (kept == 0) {
+			struct app removed = *app;
+			memmove(&Apps[i], &Apps[i + 1], (AppsCount - i - 1) * sizeof *app);
+			Apps[AppsCount - 1] = removed;
+			AppsCount--;
+			i--;
+		}
 	}
 }
 
