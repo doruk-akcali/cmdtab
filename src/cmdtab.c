@@ -1086,6 +1086,7 @@ static LRESULT CALLBACK PreviewWindowProcedure(HWND hwnd, UINT message, WPARAM w
 static handle Preview;              // Window-preview panel above the switcher (see "Window previews")
 static const COLORREF MultiGlowColor = RGB(170, 105, 255); // Glow around apps with several windows
 static const COLORREF BotGlowColor = RGB(56, 152, 255); // Blue halo on Claude while its Telegram bot window is open
+static const COLORREF SteamGlowColor = RGB(28, 64, 210); // Dark blue halo on Steam games
 
 static void GlassBoxBlur(u32 *src, u32 *dst, i32 w, i32 h, i32 r, bool vertical) // One box pass, clamped edges
 {
@@ -1640,6 +1641,46 @@ static void RemoveProcessWindows(ULONG pid)
 }
 
 // ========================================
+// Steam games (Doruk, 2026-11-26)
+// ========================================
+// While a Steam game (e.g. Overwatch, CS2) is open, Steam itself is left out of the switcher; the
+// game gets a dark blue halo, and Alt+S on it brings Steam up.
+
+static handle SteamWindow; // Most recent Steam window left out of the list (null: none listed, e.g. Steam in the tray)
+
+static bool IsSteamGamePath(const u16 *path)
+{
+	return StrStrIW(path, L"\\steamapps\\common\\") && !StrStrIW(path, L"\\wallpaper_engine\\"); // Wallpaper Engine isn't a game
+}
+
+static bool IsSteamClientPath(const u16 *path)
+{
+	const u16 *name = PathFindFileNameW(path);
+	return !_wcsicmp(name, L"steamwebhelper.exe") || !_wcsicmp(name, L"steam.exe");
+}
+
+static void HideSteamBehindGames(void)
+{
+	SteamWindow = null;
+	bool game = false;
+	for (int i = 0; i < AppsCount && !game; i++) {
+		game = IsSteamGamePath(Apps[i].path.text);
+		for (int m = 0; m < Apps[i].groupCount && !game; m++) game = IsSteamGamePath(Apps[i].groupPaths[m].text);
+	}
+	if (!game) return;
+	for (int i = 0; i < AppsCount; i++) {
+		struct app *app = &Apps[i];
+		if (app->groupCount || !IsSteamClientPath(app->path.text)) continue;
+		if (!SteamWindow && app->windowsCount) SteamWindow = app->windows[0];
+		struct app removed = *app; // Rotated to the end, so its icon stays owned by one slot
+		memmove(&Apps[i], &Apps[i + 1], (AppsCount - i - 1) * sizeof *app);
+		Apps[AppsCount - 1] = removed;
+		AppsCount--;
+		i--;
+	}
+}
+
+// ========================================
 // Snap groups (Doruk, 2026-11-24)
 // ========================================
 // Like the taskbar's snap groups: windows snapped side by side (Snap Layouts) that together fill
@@ -1818,6 +1859,7 @@ static void UpdateApps(void)
 		RemoveClosingWindows();
 	}
 	if (Config.groupByApp) AddSnapGroups();
+	if (Config.groupByApp) HideSteamBehindGames();
 	Print(L"UpdateApps (%i windows) %llims elapsed\n", windowsCount, FinishMeasuring(start));
 	PrintApps();
 }
@@ -2264,9 +2306,11 @@ static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
 		if (IsClaudeBotWindow(app->windows[j])) { bot = true; break; }
 	}
 	bool claude = bot || IsClaudeAppPath(app->path.text); // Claude always has a blue halo, a bit stronger than the purple one
-	bool glow = GlassBack != null && !app->groupCount && (app->windowsCount > 1 || claude);
-	COLORREF glowColor = claude ? BotGlowColor : MultiGlowColor;
-	f32 glowBoost = claude ? 1.4f : 1.0f;
+	bool steamGame = !app->groupCount && IsSteamGamePath(app->path.text); // Dark blue halo on Steam games
+	bool glow = GlassBack != null && !app->groupCount && (app->windowsCount > 1 || claude || steamGame);
+	COLORREF glowColor = claude ? BotGlowColor : steamGame ? SteamGlowColor : MultiGlowColor;
+	f32 glowBoost = claude ? 1.4f : steamGame ? 1.5f : 1.0f;
+	claude = claude || steamGame; // Same full-strength halo
 	f32 s = DrawingDims.drawScale;
 	RECT glowRect = {appRect.left + (i32)(s * 2), appRect.top + (i32)(s * 2), appRect.right - (i32)(s * 2), appRect.bottom - (i32)(s * 2)};
 	if (isSelected || isMouseover) {
@@ -3550,6 +3594,23 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			bool keyBUp     = keyCode == 'B' && !keyDown;
 			bool keyGDown   = keyCode == 'G' && keyDown;
 			bool keyTDown   = keyCode == 'T' && keyDown;
+			bool keySDown   = keyCode == 'S' && keyDown;
+
+			// Alt-S on a Steam game (selected, or under the mouse) - bring up Steam (Doruk, 2026-11-26)
+			if (keySDown) {
+				struct app *app = MouseApp ? MouseApp : SelectedApp;
+				if (app && !app->groupCount && IsSteamGamePath(app->path.text)) {
+					if (SteamWindow && IsWindow(SteamWindow)) {
+						ReceiveLastInputEvent();
+						ShowWindowX(SteamWindow);
+					} else { // No Steam window listed (Steam in the tray): ask Steam to open its main window
+						AllowSetForegroundWindow(ASFW_ANY);
+						ShellExecuteW(null, L"open", L"steam://open/main", null, null, SW_SHOWNORMAL);
+					}
+					HideSwitcher();
+				}
+				goto consumeMessage;
+			}
 
 			// Alt-T on Claude (selected, or under the mouse) - switch to the Claude Telegram bot window
 			if (keyTDown) {
